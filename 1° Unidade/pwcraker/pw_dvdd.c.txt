@@ -1,0 +1,431 @@
+#include <stdalign.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <immintrin.h>
+
+#define POW_2_HASHMAP (16)
+#define HASHMAP_MAX_ELEMENTS (1<<POW_2_HASHMAP)
+#define HASHMAP_EMPTY_KEY (0)
+#define HASHMAP_NOT_FOUND (0xFFFFFFFF)
+#define CARRY_OUT_CONSTANT (0xC2)
+
+// Não acho que consigo ir mais longe que isso :/
+#define DO_ROUND(shift, part) \
+    ri1 = _mm256_add_epi32(_mm256_mullo_epi32(ri1, a), c); \
+    ri2 = _mm256_add_epi32(_mm256_mullo_epi32(ri2, a), c); \
+    folded1 = _mm256_xor_si256(ri1, _mm256_srli_epi32(ri1, 16)); \
+    folded2 = _mm256_xor_si256(ri2, _mm256_srli_epi32(ri2, 16)); \
+    folded1 = _mm256_xor_si256(folded1, _mm256_srli_epi32(folded1, 8)); \
+    folded2 = _mm256_xor_si256(folded2, _mm256_srli_epi32(folded2, 8)); \
+    folded1 = _mm256_and_si256(folded1, mask); \
+    folded2 = _mm256_and_si256(folded2, mask); \
+    if (shift == 0) { \
+        acc1_##part = _mm256_xor_si256(acc1_##part, folded1); \
+        acc2_##part = _mm256_xor_si256(acc2_##part, folded2); \
+    } else { \
+        acc1_##part = _mm256_xor_si256(acc1_##part, _mm256_slli_epi32(folded1, shift)); \
+        acc2_##part = _mm256_xor_si256(acc2_##part, _mm256_slli_epi32(folded2, shift)); \
+    }
+
+    
+#define DO_8_ROUNDS() \
+    DO_ROUND(0, lo);  DO_ROUND(8, lo);  DO_ROUND(16, lo); DO_ROUND(24, lo); \
+    DO_ROUND(0, hi);  DO_ROUND(8, hi);  DO_ROUND(16, hi); DO_ROUND(24, hi); 
+
+
+
+typedef struct {
+
+    uint32_t size;
+    uint32_t pow;
+    uint64_t* keys;
+    uint32_t* values;
+    
+} Hashmap;
+
+static inline uint64_t hashmap_hash (uint64_t key){
+    return key * 11400714819323198485ULL;
+}
+
+static inline uint32_t hashmap_get (Hashmap* map, uint64_t key){
+
+    uint64_t hashedKey = hashmap_hash(key);
+    hashedKey >>= (64 - map->pow);
+
+    uint64_t elementKey;
+    uint64_t iteratorKey = hashedKey;
+    
+    uint32_t wrapAround = (1<<map->pow) - 1;
+
+    while ((elementKey = map->keys[iteratorKey]) != HASHMAP_EMPTY_KEY){
+        if (key == elementKey) return map->values[iteratorKey];
+        iteratorKey = (iteratorKey + 1) & wrapAround;
+    }
+
+    return HASHMAP_NOT_FOUND;
+
+}
+
+static inline void hashmap_insert (Hashmap* map, uint64_t key, uint32_t value){
+
+    uint64_t elementKey;
+    uint64_t iteratorKey = hashmap_hash(key) >> (64 - map->pow);
+    
+    uint32_t wrapAround = (1<<map->pow) - 1;
+
+    while ((elementKey = map->keys[iteratorKey]) != HASHMAP_EMPTY_KEY){
+        if (key == elementKey){
+            map->values[iteratorKey] = value;
+            return;
+        }
+
+        iteratorKey = (iteratorKey + 1) & wrapAround;
+    }
+
+    map->keys[iteratorKey] = key;
+    map->values[iteratorKey] = value;
+
+}
+
+static const uint8_t char_to_val[256] = {
+    // Números: 0-9 -> Valores: 1-10
+    ['0'] = 1,  ['1'] = 2,  ['2'] = 3,  ['3'] = 4,  ['4'] = 5,
+    ['5'] = 6,  ['6'] = 7,  ['7'] = 8,  ['8'] = 9,  ['9'] = 10,
+
+    // Letras Maiúsculas: A-Z -> Valores: 11-36
+    ['A'] = 11, ['B'] = 12, ['C'] = 13, ['D'] = 14, ['E'] = 15,
+    ['F'] = 16, ['G'] = 17, ['H'] = 18, ['I'] = 19, ['J'] = 20,
+    ['K'] = 21, ['L'] = 22, ['M'] = 23, ['N'] = 24, ['O'] = 25,
+    ['P'] = 26, ['Q'] = 27, ['R'] = 28, ['S'] = 29, ['T'] = 30,
+    ['U'] = 31, ['V'] = 32, ['W'] = 33, ['X'] = 34, ['Y'] = 35,
+    ['Z'] = 36,
+
+    // Letras Minúsculas: a-z -> Valores: 37-62
+    ['a'] = 37, ['b'] = 38, ['c'] = 39, ['d'] = 40, ['e'] = 41,
+    ['f'] = 42, ['g'] = 43, ['h'] = 44, ['i'] = 45, ['j'] = 46,
+    ['k'] = 47, ['l'] = 48, ['m'] = 49, ['n'] = 50, ['o'] = 51,
+    ['p'] = 52, ['q'] = 53, ['r'] = 54, ['s'] = 55, ['t'] = 56,
+    ['u'] = 57, ['v'] = 58, ['w'] = 59, ['x'] = 60, ['y'] = 61,
+    ['z'] = 62
+};
+
+static const char val_to_char[63] = {
+    '?', // 0: Índice inválido/erro
+    
+    // Números: Valores 1 a 10
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+    
+    // Letras Maiúsculas: Valores 11 a 36
+    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J',
+    'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T',
+    'U', 'V', 'W', 'X', 'Y', 'Z',
+    
+    // Letras Minúsculas: Valores 37 a 62
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j',
+    'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't',
+    'u', 'v', 'w', 'x', 'y', 'z'
+};
+
+
+
+
+uint64_t k1 [HASHMAP_MAX_ELEMENTS] = {0};
+uint32_t v1 [HASHMAP_MAX_ELEMENTS] = {0};
+
+
+Hashmap hashmap1 = {.size=HASHMAP_MAX_ELEMENTS/4, .pow=POW_2_HASHMAP-2, .keys=k1, .values=v1};
+
+
+static inline int32_t get_pw_size (uint32_t pw){
+    uint32_t count = 0;
+    uint8_t* pw_as_uint8 = (uint8_t*) &pw;
+    
+
+    count += pw_as_uint8[0] && 1;
+    count += pw_as_uint8[1] && 1;
+    count += pw_as_uint8[2] && 1;
+    count += pw_as_uint8[3] && 1;
+
+
+    return count;
+}
+
+volatile static inline uint32_t generate_next_pw (volatile register uint32_t curr){
+
+    curr++;
+
+    if ((curr & 0x000000FF) == 0x0000003F) curr += (CARRY_OUT_CONSTANT << (8 * 0));
+    if ((curr & 0x0000FF00) == 0x00003F00) curr += (CARRY_OUT_CONSTANT << (8 * 1));
+    if ((curr & 0x00FF0000) == 0x003F0000) curr += (CARRY_OUT_CONSTANT << (8 * 2));
+    if ((curr & 0xFF000000) == 0x3F000000) curr += (CARRY_OUT_CONSTANT << (8 * 3));
+
+    return curr;
+
+}
+
+static inline uint8_t mao_fold32(uint32_t x) {
+    x ^= (x >> 16);
+    x ^= (x >> 8);
+    return (uint8_t)x;
+}
+
+static inline uint32_t mao_seed_from_pw(uint32_t pw) {
+    uint32_t i;
+    uint32_t n = get_pw_size(pw);
+    uint32_t seed = 0;
+    uint8_t* pw_as_uint8 = (uint8_t*) &pw;
+
+    for (i = 0; i < n; i++) {
+        seed = (seed << 8) | ((seed >> 24) ^ val_to_char[pw_as_uint8[n - i - 1]]);
+    }
+
+    return seed;
+}
+
+
+static inline void MAO_64(uint8_t* hash, uint32_t pw) {
+    uint32_t seed = mao_seed_from_pw(pw);
+
+    // Acumula 8 bytes por bloco em vetor SSE (4 blocos de 8 rodadas = 32 rodadas).
+    uint32_t ri = seed;
+    uint8_t block_bytes[8];
+    __m128i hash_vec = _mm_loadl_epi64((const __m128i*)hash);
+
+    for (uint32_t block = 0; block < 4; block++) {
+        for (uint32_t lane = 0; lane < 8; lane++) {
+            ri = (1103515245u * ri) + 12345u;
+            block_bytes[lane] = mao_fold32(ri);
+        }
+
+        __m128i block_vec = _mm_loadl_epi64((const __m128i*)block_bytes);
+        hash_vec = _mm_xor_si128(hash_vec, block_vec);
+    }
+
+    _mm_storel_epi64((__m128i*)hash, hash_vec);
+}
+
+static inline uint64_t hash_bytes_to_uint64(uint8_t hash[8]) {
+    // Lê os 8 bytes da memória de uma vez e inverte a ordem em 1 ciclo de clock
+    return __builtin_bswap64(*(uint64_t*)hash); 
+}
+
+__attribute__((target("avx2")))
+static inline void MAO_64_batch16_avx2(uint64_t* out_hashes, const uint32_t* pws, uint32_t count) {
+    uint32_t seeds1[8] = {0};
+    uint32_t seeds2[8] = {0};
+
+    // Divide as senhas nos dois vetores de sementes
+    for (uint32_t lane = 0; lane < count; lane++) {
+        if (lane < 8) {
+            seeds1[lane] = mao_seed_from_pw(pws[lane]);
+        } else {
+            seeds2[lane - 8] = mao_seed_from_pw(pws[lane]);
+        }
+    }
+
+    __m256i ri1 = _mm256_loadu_si256((const __m256i*)seeds1);
+    __m256i ri2 = _mm256_loadu_si256((const __m256i*)seeds2);
+    
+    const __m256i a = _mm256_set1_epi32((int32_t)1103515245u);
+    const __m256i c = _mm256_set1_epi32((int32_t)12345u);
+    const __m256i mask = _mm256_set1_epi32(0xFF);
+
+    // Utilizamos apenas 4 acumuladores em vez de 16! 
+    // lo = armazena os bytes das rodadas 0 a 3. hi = bytes das rodadas 4 a 7.
+    __m256i acc1_lo = _mm256_setzero_si256();
+    __m256i acc1_hi = _mm256_setzero_si256();
+    __m256i acc2_lo = _mm256_setzero_si256();
+    __m256i acc2_hi = _mm256_setzero_si256();
+
+    __m256i folded1, folded2;
+
+    
+    // Loop Unrolling manual de 32 rodadas
+    DO_8_ROUNDS();
+    DO_8_ROUNDS();
+    DO_8_ROUNDS();
+    DO_8_ROUNDS();
+
+    #undef DO_8_ROUNDS
+    #undef DO_ROUND
+
+    // Descarregamento alinhado para a memória
+    alignas(32) uint32_t raw_acc1_lo[8];
+    alignas(32) uint32_t raw_acc1_hi[8];
+    alignas(32) uint32_t raw_acc2_lo[8];
+    alignas(32) uint32_t raw_acc2_hi[8];
+
+    _mm256_storeu_si256((__m256i*)raw_acc1_lo, acc1_lo);
+    _mm256_storeu_si256((__m256i*)raw_acc1_hi, acc1_hi);
+    _mm256_storeu_si256((__m256i*)raw_acc2_lo, acc2_lo);
+    _mm256_storeu_si256((__m256i*)raw_acc2_hi, acc2_hi);
+
+    // MONTAGEM DO HASH: Sem arrays de char, tudo via registradores ALU.
+    // __builtin_bswap32 inverte os 4 bytes perfeitamente para simular o Big Endian nativamente
+    for (uint32_t lane = 0; lane < count; lane++) {
+        if (lane < 8) {
+            uint64_t top = __builtin_bswap32(raw_acc1_lo[lane]);
+            uint64_t bot = __builtin_bswap32(raw_acc1_hi[lane]);
+            out_hashes[lane] = (top << 32) | bot;
+        } else {
+            uint64_t top = __builtin_bswap32(raw_acc2_lo[lane - 8]);
+            uint64_t bot = __builtin_bswap32(raw_acc2_hi[lane - 8]);
+            out_hashes[lane] = (top << 32) | bot;
+        }
+    }
+}
+
+
+
+uint32_t answers[1024] = {0};
+
+static inline void MAO_64_batch(uint64_t* out_hashes, const uint32_t* pws, uint32_t count) {
+    uint32_t i;
+
+    if (count == 0) {
+        return;
+    }
+
+#if defined(__x86_64__) || defined(__i386__)
+    if (count >= 4 && __builtin_cpu_supports("avx2")) {
+        MAO_64_batch16_avx2(out_hashes, pws, count);
+        return;
+    }
+#endif
+
+    for (i = 0; i < count; i++) {
+        uint8_t hash_bytes[8] = {0};
+        MAO_64(hash_bytes, pws[i]);
+        out_hashes[i] = hash_bytes_to_uint64(hash_bytes);
+    }
+}
+
+
+typedef struct {
+    Hashmap* map;
+    uint32_t initial_pw;
+    uint32_t last_pw;
+} thread_args;
+
+static inline void* BEM_64 (void* ARGS){
+
+    thread_args* args = (thread_args*) ARGS;
+
+    volatile register uint32_t pw = args->initial_pw;
+    volatile register uint32_t last_pw = args->last_pw;
+
+    while (pw != last_pw) {
+        uint32_t batch_size = 0;
+        uint32_t pw_batch[16];
+        uint64_t hash_batch[16];
+
+        while (batch_size < 16 && pw != last_pw) {
+            pw = generate_next_pw(pw);
+            pw_batch[batch_size] = pw;
+            batch_size++;
+        }
+
+        MAO_64_batch(hash_batch, pw_batch, batch_size);
+        
+        for (uint32_t i = 0; i < batch_size; i++) {
+            uint32_t getPos = hashmap_get(args->map, hash_batch[i]);
+            if (getPos != HASHMAP_NOT_FOUND) {
+                answers[getPos] = pw_batch[i];
+            }
+            
+        }
+
+    }
+
+    return NULL;
+
+}
+
+
+
+
+char user[20];
+char* users[1024] = {0};
+
+
+int main (int argc, char* argv[]){
+
+
+    pthread_t threads [4];
+    thread_args args[4];
+
+    args[0].map = &hashmap1;
+    args[0].initial_pw = 0x3E;
+    args[0].last_pw = 0x0F2E2F1F;
+
+    args[1].map = &hashmap1;
+    args[1].initial_pw = 0x0F2E2F1F;
+    args[1].last_pw = 0x1F1F1F3E;
+
+    args[2].map = &hashmap1;
+    args[2].initial_pw = 0x1F1F1F3E;
+    args[2].last_pw = 0x2F10101F;
+
+    args[3].map = &hashmap1;
+    args[3].initial_pw = 0x2F10101F;
+    args[3].last_pw = 0x3E3E3E3E;
+
+    //exit(0);
+
+    uint32_t palavra = 0;
+
+    FILE* I_FILE = fopen(argv[1], "r");
+    FILE* O_FILE = fopen(argv[2], "w");
+
+
+    uint32_t qtd; fscanf(I_FILE, "%u", &qtd);
+    
+
+
+
+    for (uint32_t i = 0; i < qtd; i++){
+        uint64_t hashToBreak;
+        fscanf(I_FILE, " %18[^:]:%16" SCNx64, user, &hashToBreak);
+        char* user_copy = strdup(user);
+        users[i] = user_copy;
+        
+        hashmap_insert(&hashmap1, hashToBreak, i);
+        
+    }
+
+    
+
+    
+    for (int i = 0; i < 4; i++){
+        pthread_create(&threads[i], NULL, BEM_64, &args[i]);
+    }
+
+    for (int i = 0; i < 4; i++){
+        pthread_join(threads[i], NULL);
+    }
+    
+    char pw_text[5];
+
+    for (uint32_t i = 0; i < qtd; i++){
+        uint32_t pw = answers[i];
+        int32_t pw_size = get_pw_size(pw);
+
+
+        for (int j = 0; j < pw_size; j++){
+            pw_text[pw_size - 1 - j] = val_to_char[(pw >> (8 * j)) & 0xFF ];
+        }
+
+        pw_text[pw_size] = '\0';
+
+        fprintf(O_FILE, "%s:%s\n", users[i], pw_text);
+
+        free(users[i]);
+        
+    }
+
+    return 0;
+}

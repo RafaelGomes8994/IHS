@@ -3,8 +3,8 @@
 .section .note.GNU-stack, "", @progbits
 
 .section .data
-    fmt_hex:        .asciz "%x"             # Para Paleta, X, Y e B
-    fmt_dec:        .asciz "%d"             # Apenas para Qtd Imagens e M
+    fmt_hex:        .asciz "%x"             # para paleta, x, y e b
+    fmt_dec:        .asciz "%d"             # para qtd imagens e m
     fmt_char:       .asciz "%c"
     fmt_newline:    .asciz "\n"
     fmt_comp_rate:  .asciz "[%d%%]\n"
@@ -15,13 +15,13 @@
 .section .bss
     .lcomm palette, 16              
     
-    .lcomm canvas, 4000000          # 4 Megabytes de Matriz 2D!
-    .lcomm triplas_x, 4000000       # Posições suficientes para ficheiros enormes
-    .lcomm triplas_y, 4000000         
-    .lcomm triplas_b, 4000000         
+    .lcomm canvas, 2000000          # 2 megabytes de matriz 2d
+    .lcomm triplas_x, 2000000       # posicoes suficientes para ficheiros grandes
+    .lcomm triplas_y, 2000000         
+    .lcomm triplas_b, 2000000         
     
     .lcomm temp_val, 4
-    .lcomm max_b_val, 4             # Guarda o 'B' do maior par (Y, X)
+    .lcomm max_b_val, 4             # guarda o b do maior par (y, x)
     .lcomm qtd_imagens, 4
     .lcomm expected_m, 4            
 
@@ -32,7 +32,7 @@
 .global main
 
 main:
-    # PRÓLOGO E ABRIR FICHEIROS
+    # prologo e abrir ficheiros
     PUSH rbp
     MOV rbp, rsp
     PUSH rbx
@@ -61,7 +61,7 @@ main:
     JE .fechar_input_e_sair
     MOV QWORD PTR [rip + outputF], rax
 
-    # 1. LER PALETA (Hexadecimal %x)
+    # 1. ler paleta (hexadecimal %x)
     XOR r12, r12
 .ler_paleta:
     CMP r12, 16
@@ -80,7 +80,7 @@ main:
     JMP .ler_paleta
 .fim_paleta:
 
-    # 2. LER QUANTIDADE DE IMAGENS (Decimal %d)
+    # 2. ler quantidade de imagens (decimal %d)
     MOV rdi, QWORD PTR [rip + inputF]
     LEA rsi, [rip + fmt_dec]            
     LEA rdx, [rip + temp_val]
@@ -96,7 +96,7 @@ main:
     CMP eax, 0
     JLE .fim_programa
 
-    # 3. LER QUANTIDADE DE TRIPLAS 'm' (Decimal %d)
+    # le a quant de triplas 'm' (decimal %d)
     MOV rdi, QWORD PTR [rip + inputF]
     LEA rsi, [rip + fmt_dec]            
     LEA rdx, [rip + temp_val]
@@ -108,20 +108,20 @@ main:
     MOV eax, DWORD PTR [rip + temp_val]
     MOV DWORD PTR [rip + expected_m], eax    
 
-    # Reset das variáveis para a nova imagem
+    # reseta as variaveis para a nova imagem
     MOV r12d, -1                    # max_x = -1
     MOV r13d, -1                    # max_y = -1
     MOV DWORD PTR [rip + max_b_val], 0 
     XOR r14, r14                    # contador de triplas = 0
     XOR rbx, rbx                    # bytes lidos = 0
 
-    # 4. LER AS TRIPLAS E DESCOBRIR O MAIOR PAR (Y, X) 
+    # le as triplas e pega o maior par de (y, x)
 .ler_triplas:
     MOV eax, DWORD PTR [rip + expected_m]
     CMP r14d, eax
     JGE .processar
 
-    # --- LER X (Hexadecimal %x) ---
+    # --- ler x (hexadecimal %x) ---
     MOV rdi, QWORD PTR [rip + inputF]
     LEA rsi, [rip + fmt_hex]
     LEA rdx, [rip + temp_val]
@@ -135,7 +135,7 @@ main:
     MOV DWORD PTR [r8 + r14*4], eax
 
 .ler_y:
-    # --- LER Y (Hexadecimal %x) ---
+    # --- ler y (hexadecimal %x) ---
     MOV rdi, QWORD PTR [rip + inputF]
     LEA rsi, [rip + fmt_hex]
     LEA rdx, [rip + temp_val]
@@ -149,7 +149,7 @@ main:
     MOV DWORD PTR [r8 + r14*4], eax
 
 .ler_b:
-    # --- LER B (Hexadecimal %x) ---
+    # --- ler b (hexadecimal %x) ---
     MOV rdi, QWORD PTR [rip + inputF]
     LEA rsi, [rip + fmt_hex]
     LEA rdx, [rip + temp_val]
@@ -163,47 +163,45 @@ main:
     MOV DWORD PTR [r8 + r14*4], eax
 
 
-    MOV r9d, eax                      # r9d = B (Acabou de ser lido)
+    MOV r9d, eax                      # r9d = b lido
     LEA r8, [rip + triplas_y]
-    MOV r11d, DWORD PTR [r8 + r14*4]  # r11d = Y intacto!
+    MOV r11d, DWORD PTR [r8 + r14*4]  # r11d = y lido
     LEA r8, [rip + triplas_x]
-    MOV r10d, DWORD PTR [r8 + r14*4]  # r10d = X intacto!
+    MOV r10d, DWORD PTR [r8 + r14*4]  # r10d = x lido
 
-    # --- LÓGICA DO MAIOR PAR (Y, X) ---
-    CMP r11d, r13d                  # Compara Y atual com max_y
-    JG .atualiza_maior_par          # Se Y atual for MAIOR, atualiza tudo!
-    JL .pula_atualizacao            # Se Y atual for MENOR, ignora e avança
+    # --- logica do maior par (y, x) ---
+    CMP r11d, r13d                  # compara y atual com max_y
+    JG .atualiza_maior_par          # se y atual for maior, atualiza tudo
+    JL .pula_atualizacao            # se y atual for menor, ignora e avanca
     
-    # Se houver empate no Y (Y atual == max_y), o X decide
-    CMP r10d, r12d                  # Compara X atual com max_x
-    JLE .pula_atualizacao           # Se X for MENOR ou IGUAL, ignora e avança
+    # se houver empate no y, o x decide
+    CMP r10d, r12d                  # compara x atual com max_x
+    JLE .pula_atualizacao           # se x for menor ou igual, ignora e avanca
 
 .atualiza_maior_par:
-    MOV r13d, r11d                  # Atualiza max_y com o Y atual
-    MOV r12d, r10d                  # Atualiza max_x com o X atual
-    MOV DWORD PTR [rip + max_b_val], r9d # Guarda o B pertencente a este par!
+    MOV r13d, r11d                  # atualiza max_y com o y atual
+    MOV r12d, r10d                  # atualiza max_x com o x atual
+    MOV DWORD PTR [rip + max_b_val], r9d # guarda o b deste par
 
 .pula_atualizacao:
-    ADD rbx, 3                      # Conta 3 bytes para a compressão
+    ADD rbx, 3                      # conta 3 bytes para a compressao
     INC r14d
     JMP .ler_triplas
 
-    # 5. PREPARAR A MATRIZ 2D E DESENHAR
 
 .processar:
-    # --- CÁLCULO FINAL DE LARGURA E ALTURA ---
+    # --- calculo final de largura e altura ---
     MOV eax, DWORD PTR [rip + max_b_val]
-    SHR eax, 4                      # Extrai as Repetições do maior par
-    ADD r12d, eax                   # LARGURA = max_x + Repetições
+    SHR eax, 4                      # extrai as repeticoes do maior par
+    ADD r12d, eax                   # largura = max_x + repeticoes
 
-    INC r13d                        # ALTURA = max_y + 1
+    INC r13d                        # altura = max_y + 1
 
-    # MEMSET CIRÚRGICO: Limpa apenas a Área LxA com ZERO ABSOLUTO (\0)
     MOV eax, r12d
-    IMUL eax, r13d                  # Calcula LxA exato em eax
-    MOV rdx, rax                    # RDX recebe o tamanho exato a limpar
+    IMUL eax, r13d                  # calcula lxA  em eax
+    MOV rdx, rax                    # rdx recebe o tamanho q tem q limpar
     LEA rdi, [rip + canvas]
-    XOR esi, esi                    # Preenche com 0 (\0)
+    XOR esi, esi                    # preenche com 0 (\0)
     CALL memset@plt
 
     XOR r15d, r15d                  
@@ -213,22 +211,22 @@ main:
     JGE .imprimir
 
     LEA r8, [rip + triplas_x]
-    MOV eax, DWORD PTR [r8 + r15*4] # X
+    MOV eax, DWORD PTR [r8 + r15*4] # x
     
     LEA r8, [rip + triplas_y]
-    MOV ecx, DWORD PTR [r8 + r15*4] # Y
+    MOV ecx, DWORD PTR [r8 + r15*4] # y
     
     LEA r8, [rip + triplas_b]
-    MOV edx, DWORD PTR [r8 + r15*4] # B
+    MOV edx, DWORD PTR [r8 + r15*4] # b
 
     MOV edi, edx
-    SHR edi, 4                      # Extrai Repetições
-    AND edx, 0x0F                   # Extrai Índice
+    SHR edi, 4                      # extrai repeticoes
+    AND edx, 0x0F                   # extrai indice
     
     LEA r8, [rip + palette]
-    MOVZX edx, BYTE PTR [r8 + rdx]  # Transforma Índice no Caractere
+    MOVZX edx, BYTE PTR [r8 + rdx]  # transforma indice no caractere
 
-    # Calcula a Posição na Memória = vetor[Y][X] -> (Y * Largura) + X
+    # calcula a posicao na memoria = vetor[y][x] -> (y * largura) + x
     MOV r9d, eax                    
     MOV eax, ecx
     IMUL eax, r12d
@@ -240,8 +238,8 @@ main:
 .rep_loop:
     TEST edi, edi
     JZ .next_triple
-    MOV BYTE PTR [rcx], dl          # Subscreve o caractere perfeitamente
-    INC rcx                         # Avança o cursor 1 pixel (X + 1)
+    MOV BYTE PTR [rcx], dl          # sobrescreve o caractere
+    INC rcx                         # avanca o cursor 1 pixel (x + 1)
     DEC edi
     JMP .rep_loop
 
@@ -249,14 +247,14 @@ main:
     INC r15d
     JMP .desenhar
 
-    # 6. MATEMÁTICA E SAÍDA DE DADOS (Percorrendo a Matriz [Y][X]
+    # 6. matematica e saida de dados (percorrendo a matriz [y][x]
 .imprimir:
-    # Área = Largura * Altura
+    # area = largura * altura
     MOV eax, r12d
     IMUL eax, r13d
     MOV r9d, eax                    
 
-    # Taxa de Compressão = (Bytes Lidos * 100) / Área
+    # taxa de compressao = (bytes lidos * 100) / area
     MOV rax, rbx                    
     IMUL rax, 100                   
     
@@ -277,17 +275,17 @@ main:
     XOR eax, eax                    
     CALL fprintf@plt
 
-    XOR r14d, r14d                  # Y = 0
+    XOR r14d, r14d                  # y = 0
 .print_y:
     CMP r14d, r13d
     JGE .fim_imagem
     
-    XOR r15d, r15d                  # X = 0
+    XOR r15d, r15d                  # x = 0
 .print_x:
     CMP r15d, r12d
     JGE .print_nl
     
-    # Acesso à Matriz: vetor[Y][X] -> [Y * Largura + X]
+    # acesso a matriz: vetor[y][x] -> [y * largura + x]
     MOV eax, r14d
     IMUL eax, r12d
     ADD eax, r15d
@@ -318,13 +316,13 @@ main:
     XOR eax, eax
     CALL fprintf@plt
 
-    # Subtrai 1 à Qtd de Imagens e recomeça o ciclo
+    # subtrai 1 a qtd de imagens e recomeça o ciclo
     MOV eax, DWORD PTR [rip + qtd_imagens]
     DEC eax
     MOV DWORD PTR [rip + qtd_imagens], eax
     JMP .loop_imagens
 
-    # EPÍLOGO 
+    # epilogo
 
 .fechar_input_e_sair:
     MOV rdi, QWORD PTR [rip + inputF]

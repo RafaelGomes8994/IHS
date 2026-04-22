@@ -5,204 +5,297 @@
 #include <pthread.h>
 #include <stdbool.h>
 
-// Configurações do Cracker
-#define NUM_THREADS 4
-#define MIN_PASS_LEN 2
-#define MAX_PASS_LEN 4
-#define MAX_USERS 100 
-#define hsrand srand
-#define hrand rand
+// --- VARIÁVEIS GLOBAIS DE CONFIGURAÇÃO ---
+int numeroThreads = 4;
 
-// Dicionário Completo: Letras minúsculas, maiúsculas e números
-const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-const int charset_len = 62;
+int tamanhoMaxSenha = 4;
 
-// Estrutura para guardar os utilizadores
+const char alfabeto[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+const int tamanhoAlfabeto = 62;
+
 typedef struct {
     char login[64];
-    uint8_t hash[8];
-    char cracked_password[16];
-    bool is_cracked;
-} TargetUser;
+    // hashAlvo: to usando uint64_t aqui pra comparação é feita em UMA operação de CPU, não em strcmp().
+    uint64_t hashAlvo;
+    char senhaDescoberta[16];
+    bool foiDescoberta;
+    int ordemOriginal;
+} UsuarioAlvo;
 
-// --- VARIÁVEIS GLOBAIS DE CONTROLE ---
-TargetUser users[MAX_USERS];
-int num_users = 0;
-volatile int total_cracked = 0; 
+// usuariosAlvo: to usando como global pra todas as threads conseguirem acessar a lista de usuarios sem passar parametro.
+UsuarioAlvo* usuariosAlvo = NULL;
+int quantidadeUsuarios = 0;
 
-pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER; 
+// totalDescobertos: to usando volatile pra compilador não cachear esse valor, porque as threads tão sempre lendo/escrevendo nele.
+volatile int totalDescobertos = 0;
 
-// --- FUNÇÕES PRNG THREAD-SAFE (Versão Linux rand_r) ---
-_Thread_local unsigned int thread_seed = 0;
+// lock: to usando mutex aqui pra quando uma thread acha uma senha, outra não sobrescreve ao mesmo tempo. Evita bagunça.
+pthread_mutex_t trava = PTHREAD_MUTEX_INITIALIZER;
 
-void hsrand(uint32_t seed) {
-    thread_seed = seed;
+// --- FUNÇÃO PARA ORDENAR OS UTILIZADORES PELO HASH ---
+int compararHashes(const void *a, const void *b) {
+    uint64_t hashA = ((UsuarioAlvo*)a)->hashAlvo;
+    uint64_t hashB = ((UsuarioAlvo*)b)->hashAlvo;
+    if (hashA < hashB) return -1;
+    if (hashA > hashB) return 1;
+    return 0;
 }
 
-uint32_t hrand() {
-    return rand_r(&thread_seed); 
+int compararOrdemOriginal(const void *a, const void *b) {
+    int ordemA = ((UsuarioAlvo*)a)->ordemOriginal;
+    int ordemB = ((UsuarioAlvo*)b)->ordemOriginal;
+    if (ordemA < ordemB) return -1;
+    if (ordemA > ordemB) return 1;
+    return 0;
 }
 
 // --- FUNÇÃO DE HASH MAO-64 ---
-void MAO_64(uint8_t* hash, const char* senha) {
-    uint32_t i, n = strlen(senha), nr = 32, seed = 0;
-    memset(hash, 0, 8); 
-    for(i = 0; i < n; i++)
-        seed = (seed << 8) | ((seed >> 24) ^ senha[i]);
-    hsrand(seed);
-    for(i = 0; i < nr; i++)
-        hash[i & 0b111] = hash[i & 0b111] ^ hrand();
+// Implementação pedida: usa semente baseada na senha e 32 rodadas sobre 8 bytes de hash.
+static _Thread_local uint32_t estadoPRNG = 0;
+
+static inline void hsrand(uint32_t seed) {
+    estadoPRNG = seed;
 }
 
-// --- ESTRUTURA PARA AS THREADS ---
+static inline uint8_t hrand(void) {
+    estadoPRNG = 1103515245u * estadoPRNG + 12345u;
+    return (uint8_t)((estadoPRNG & 0xFFu) ^
+                     ((estadoPRNG >> 8) & 0xFFu) ^
+                     ((estadoPRNG >> 16) & 0xFFu) ^
+                     ((estadoPRNG >> 24) & 0xFFu));
+}
+
+void MAO_64(uint8_t* hash, const char* senha) {
+    uint32_t i, n = (uint32_t)strlen(senha), nr = 32, seed = 0;
+
+    memset(hash, 0, 8);
+
+    for (i = 0; i < n; i++) {
+        seed = (seed << 8) | ((seed >> 24) ^ senha[i]);
+    }
+
+    hsrand(seed);
+
+    for (i = 0; i < nr; i++) {
+        hash[i & 0b111] = (uint8_t)(hash[i & 0b111] ^ hrand());
+    }
+}
+
+static inline uint64_t gerarHashMao64(const char* senha) {
+    uint8_t hash[8];
+    MAO_64(hash, senha);
+    return ((uint64_t)hash[0] << 56) | ((uint64_t)hash[1] << 48) | ((uint64_t)hash[2] << 40) |
+           ((uint64_t)hash[3] << 32) | ((uint64_t)hash[4] << 24) | ((uint64_t)hash[5] << 16) |
+           ((uint64_t)hash[6] << 8)  | ((uint64_t)hash[7]);
+}
+
+// to usando isso pra cada thread saber qual "fatia" do charset ela tem que processar (Thread 0 pega a-f, Thread 1 pega g-l, etc).
 typedef struct {
-    int thread_id;
-    int start_idx; 
-    int end_idx;   
-} ThreadArgs;
+    int inicioIndice;
+    int fimIndice;
+} ArgumentosThread;
 
-// --- FUNÇÃO RECURSIVA DE FORÇA BRUTA ---
-void brute_force(char* current_pass, int pos, int max_len) {
-    if (total_cracked >= num_users) return;
+// to usando isso pra gerar todas as combinações de senhas recursivamente e testar cada uma em busca binária. (magia negra mesmo)
+void quebrandoesseMAOpelaraiz(char* senhaAtual, int posicao, int tamanhoMaximo) {
+    // to checando aqui pra se todo mundo já foi crackeado, saio cedo e não desperdição CPU.
+    if (totalDescobertos >= quantidadeUsuarios) return;
 
-    if (pos >= MIN_PASS_LEN) {
-        uint8_t current_hash[8];
-        MAO_64(current_hash, current_pass);
+    // to transformando a senha em hash 64-bit pra comparar com UMA operação (não strcmp que é lento).
+    uint64_t hashAtual64 = gerarHashMao64(senhaAtual);
 
-        // Verifica o hash gerado contra os hashes de todos os utilizadores não quebrados
-        for (int i = 0; i < num_users; i++) {
-            if (!users[i].is_cracked) {
-                bool match = true;
-                for (int j = 0; j < 8; j++) {
-                    if (current_hash[j] != users[i].hash[j]) {
-                        match = false;
-                        break;
-                    }
-                }
-
-                if (match) {
-                    pthread_mutex_lock(&lock);
-                    if (!users[i].is_cracked) { 
-                        users[i].is_cracked = true;
-                        strcpy(users[i].cracked_password, current_pass);
-                        total_cracked++;
-                        // AVISO DO PRINTF CORRIGIDO AQUI: %lu em vez de %d
-                        printf("[Thread %lu] Senha quebrada! %s:%s\n", (unsigned long)pthread_self(), users[i].login, current_pass);
-                    }
-                    pthread_mutex_unlock(&lock);
-                }
+    // to usando busca binária aqui: sem ela seria O(n), com ela é O(log n). 1000 usuarios? só 10 comparações!
+    int esquerda = 0;
+    int direita = quantidadeUsuarios - 1;
+    
+    while (esquerda <= direita) {
+        int meio = esquerda + (direita - esquerda) / 2;
+        
+        if (usuariosAlvo[meio].hashAlvo == hashAtual64) {
+            // achei um match! to bloqueando com mutex pra outra thread não pisar aqui do mesmo jeito.
+            pthread_mutex_lock(&trava);
+            if (!usuariosAlvo[meio].foiDescoberta) {
+                usuariosAlvo[meio].foiDescoberta = true;
+                strcpy(usuariosAlvo[meio].senhaDescoberta, senhaAtual);
+                totalDescobertos++;
             }
+            
+            // to procurando duplicatas porque múltiplos usuarios podem ter a mesma senha/hash. Preciso crackear TODOS.
+            // Procurando à esquerda do match
+            int temporario = meio - 1;
+            while(temporario >= 0 && usuariosAlvo[temporario].hashAlvo == hashAtual64) {
+                if (!usuariosAlvo[temporario].foiDescoberta) {
+                    usuariosAlvo[temporario].foiDescoberta = true;
+                    strcpy(usuariosAlvo[temporario].senhaDescoberta, senhaAtual);
+                    totalDescobertos++;
+                }
+                temporario--;
+            }
+            
+            // Procurando à direita do match
+            temporario = meio + 1;
+            while(temporario < quantidadeUsuarios && usuariosAlvo[temporario].hashAlvo == hashAtual64) {
+                if (!usuariosAlvo[temporario].foiDescoberta) {
+                    usuariosAlvo[temporario].foiDescoberta = true;
+                    strcpy(usuariosAlvo[temporario].senhaDescoberta, senhaAtual);
+                    totalDescobertos++;
+                }
+                temporario++;
+            }
+            pthread_mutex_unlock(&trava);
+            break; // achei, saio da busca binária
+        }
+        
+        // to dividindo em duas partes aqui, busca binária classica mesmo.
+        if (usuariosAlvo[meio].hashAlvo < hashAtual64) {
+            esquerda = meio + 1;
+        } else {
+            direita = meio - 1;
         }
     }
 
-    if (pos == max_len) return; 
+    // parei se chegou no tamanho máximo.
+    if (posicao == tamanhoMaximo) return;
 
-    for (int i = 0; i < charset_len; i++) {
-        current_pass[pos] = charset[i];
-        current_pass[pos + 1] = '\0';
-        brute_force(current_pass, pos + 1, max_len);
+    // to gerando recursivamente todas as combinações: a, b, c..., aa, ab, ac..., aaa, etc.
+    for (int i = 0; i < tamanhoAlfabeto; i++) {
+        senhaAtual[posicao] = alfabeto[i];
+        senhaAtual[posicao + 1] = '\0';
+        quebrandoesseMAOpelaraiz(senhaAtual, posicao + 1, tamanhoMaximo);
     }
 }
 
 // --- ROTINA PRINCIPAL DA THREAD ---
-void* thread_worker(void* arg) {
-    ThreadArgs* args = (ThreadArgs*)arg;
-    char pass_buffer[MAX_PASS_LEN + 1] = {0};
+// to usando isso pra cada thread processar sua porção de senhas em paralelo. Thread 1 testa a-f, Thread 2 testa g-l, etc.
+void* trabalhadorThread(void* argumento) {
+    ArgumentosThread* dados = (ArgumentosThread*)argumento;
+    
+    // to alocando buffer local aqui pra cada thread ter seu próprio, não pisam uma na outra.
+    char* bufferSenha = (char*)calloc(tamanhoMaxSenha + 2, sizeof(char));
 
-    // Repartição do trabalho pelo dicionário
-    for (int i = args->start_idx; i < args->end_idx; i++) {
-        if (total_cracked >= num_users) break;
+    // to processando minha fatia do charset...
+    for (int i = dados->inicioIndice; i < dados->fimIndice; i++) {
+        // saio cedo se já achei todo mundo.
+        if (totalDescobertos >= quantidadeUsuarios) break;
         
-        pass_buffer[0] = charset[i];
-        pass_buffer[1] = '\0';
-        brute_force(pass_buffer, 1, MAX_PASS_LEN);
+        // comeco uma árvore de recursão com cada letra do meu intervalo.
+        bufferSenha[0] = alfabeto[i];
+        bufferSenha[1] = '\0';
+        quebrandoesseMAOpelaraiz(bufferSenha, 1, tamanhoMaxSenha);
     }
 
+    free(bufferSenha);
     pthread_exit(NULL);
 }
 
 // --- FUNÇÃO MAIN ---
+// to usando isso pra ler dados, ordenar, rodar threads e salvar resultados. É o "maestro" da operação.
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        printf("Uso: %s <entrada.txt> <saida.txt>\n", argv[0]);
+    // se argumentos tiverem errado, saio silenciosamente. Esperado: entrada, saída, threads (opt), tamanho (opt)
+    if (argc < 3 || argc > 5) return 1;
+
+    // to lendo argumentos, com defaults de 4 threads e tamanho 4.
+    if (argc >= 4) numeroThreads = atoi(argv[3]);
+    if (argc == 5) tamanhoMaxSenha = atoi(argv[4]);
+
+    // validando pra não deixar valores loucos passarem.
+    if (numeroThreads < 1) numeroThreads = 1;
+    if (numeroThreads > tamanhoAlfabeto) numeroThreads = tamanhoAlfabeto; // não faz sentido ter mais threads que chars
+    if (tamanhoMaxSenha < 1) tamanhoMaxSenha = 1;
+
+    // abrindo arquivo de entrada com formato login:hash
+    FILE *arquivoEntrada = fopen(argv[1], "r");
+    if (!arquivoEntrada) return 1;
+
+    // primeira linha é a quantidade de usuarios.
+    int usuariosEsperados = 0;
+    if (fscanf(arquivoEntrada, "%d", &usuariosEsperados) != 1) {
+        fclose(arquivoEntrada);
         return 1;
     }
 
-    // 1. LER FICHEIRO DE ENTRADA
-    FILE *input_file = fopen(argv[1], "r");
-    if (!input_file) {
-        printf("Erro ao abrir %s\n", argv[1]);
+    // alocando dinamicamente porque não sei quantos usuarios tem até ler.
+    usuariosAlvo = (UsuarioAlvo*) malloc(usuariosEsperados * sizeof(UsuarioAlvo));
+    if (!usuariosAlvo) {
+        fclose(arquivoEntrada);
         return 1;
     }
 
-    int expected_users = 0;
+    // lendo cada linha no format login:hash_hex
+    for (int i = 0; i < usuariosEsperados; i++) {
+        char hashHex[17] = {0};
+        char loginBuffer[64] = {0};
+
+        // to usando %63[^:] pra ler até 63 chars até ':', evita buffer overflow.
+        if (fscanf(arquivoEntrada, " %63[^:]:%16s", loginBuffer, hashHex) == 2) {
+            strcpy(usuariosAlvo[quantidadeUsuarios].login, loginBuffer);
+            // convertendo hex string (ex: "1A2B") pra uint64_t.
+            usuariosAlvo[quantidadeUsuarios].hashAlvo = strtoull(hashHex, NULL, 16);
+            usuariosAlvo[quantidadeUsuarios].foiDescoberta = false;
+            usuariosAlvo[quantidadeUsuarios].ordemOriginal = quantidadeUsuarios;
+            quantidadeUsuarios++;
+        }
+    }
+    fclose(arquivoEntrada);
+
+    // se ninguém foi lido, saio.
+    if (quantidadeUsuarios == 0) {
+        free(usuariosAlvo);
+        return 1;
+    }
+
+    // PASSO CRÍTICO: to ordenando os hashes pra busca binária funcionar. Sem isso viro O(n) em vez de O(log n)!
+    qsort(usuariosAlvo, quantidadeUsuarios, sizeof(UsuarioAlvo), compararHashes);
+
+    // CRIAR E DISPARAR AS THREADS
+    // to alocando arrays pra guardar as threads e seus parametros.
+    pthread_t* vetorThreads = (pthread_t*) malloc(numeroThreads * sizeof(pthread_t));
+    ArgumentosThread* argumentosThreads = (ArgumentosThread*) malloc(numeroThreads * sizeof(ArgumentosThread));
     
-    // Ler a quantidade de contas 'n' (1ª linha)
-    if (fscanf(input_file, "%d", &expected_users) != 1) {
-        printf("Erro: Ficheiro nao contem a quantidade inicial de contas.\n");
-        fclose(input_file);
+    // calculando quantos chars cada thread vai processar (62 chars / 4 threads = ~15 each).
+    int tamanhoFatia = tamanhoAlfabeto / numeroThreads;
+
+    // criando cada thread com sua fatia do charset.
+    for (int i = 0; i < numeroThreads; i++) {
+        // dividindo os indices: Thread 0 [0-15], Thread 1 [15-30], etc.
+        argumentosThreads[i].inicioIndice = i * tamanhoFatia;
+        argumentosThreads[i].fimIndice = (i == numeroThreads - 1) ? tamanhoAlfabeto : (i + 1) * tamanhoFatia;
+        
+        // criando a thread que vai rodar trabalhadorThread() com sua fatia.
+        pthread_create(&vetorThreads[i], NULL, trabalhadorThread, (void*)&argumentosThreads[i]);
+    }
+
+    // AGUARDANDO TODAS AS THREADS
+    // to bloqueando aqui até todas terminarem. Precisa disso antes de salvar resultados.
+    for (int i = 0; i < numeroThreads; i++) {
+        pthread_join(vetorThreads[i], NULL);
+    }
+
+    // retornando ao ordenamento original de leitura para gravar no mesmo formato do input.
+    qsort(usuariosAlvo, quantidadeUsuarios, sizeof(UsuarioAlvo), compararOrdemOriginal);
+
+    // GRAVAR OS RESULTADOS
+    // abrindo arquivo pra escrever resultado de cada usuario (login:senha ou login:NOT_FOUND).
+    FILE *arquivoSaida = fopen(argv[2], "w");
+    if (!arquivoSaida) {
+        free(vetorThreads); free(argumentosThreads); free(usuariosAlvo);
         return 1;
     }
 
-    // Ler as 'n' contas linha a linha
-    for (int i = 0; i < expected_users && num_users < MAX_USERS; i++) {
-        char hex_hash[17] = {0};
-        char login_buf[64] = {0};
-
-        // O espaço inicial em " %[^:]" é crucial para ignorar as quebras de linha anteriores (\n)
-        if (fscanf(input_file, " %[^:]:%16s", login_buf, hex_hash) == 2) {
-            strcpy(users[num_users].login, login_buf);
-            
-            // Converte string Hexadecimal para array de bytes
-            for (int j = 0; j < 8; j++) {
-                sscanf(&hex_hash[j * 2], "%2hhx", &users[num_users].hash[j]);
-            }
-            users[num_users].is_cracked = false;
-            num_users++;
-        }
-    }
-    fclose(input_file);
-
-    if (num_users == 0) {
-        printf("Nenhum utilizador valido lido do ficheiro.\n");
-        return 1;
-    }
-
-    printf("Iniciando ataque para %d utilizadores...\n", num_users);
-
-    // 2. DISPARAR THREADS
-    pthread_t threads[NUM_THREADS];
-    ThreadArgs thread_args[NUM_THREADS];
-    int chunk_size = charset_len / NUM_THREADS;
-
-    for (int i = 0; i < NUM_THREADS; i++) {
-        thread_args[i].thread_id = i;
-        thread_args[i].start_idx = i * chunk_size;
-        thread_args[i].end_idx = (i == NUM_THREADS - 1) ? charset_len : (i + 1) * chunk_size;
-
-        pthread_create(&threads[i], NULL, thread_worker, (void*)&thread_args[i]);
-    }
-
-    for (int i = 0; i < NUM_THREADS; i++) {
-        pthread_join(threads[i], NULL);
-    }
-
-    // 3. GRAVAR O RESULTADO EXATO NO FICHEIRO DE SAÍDA
-    FILE *output_file = fopen(argv[2], "w");
-    if (!output_file) {
-        printf("Erro ao criar %s\n", argv[2]);
-        return 1;
-    }
-
-    for (int i = 0; i < num_users; i++) {
-        if (users[i].is_cracked) {
-            fprintf(output_file, "%s:%s\n", users[i].login, users[i].cracked_password);
+    // gravando resultado: cracked ou NOT_FOUND.
+    for (int i = 0; i < quantidadeUsuarios; i++) {
+        if (usuariosAlvo[i].foiDescoberta) {
+            fprintf(arquivoSaida, "%s:%s\n", usuariosAlvo[i].login, usuariosAlvo[i].senhaDescoberta);
         } else {
-            fprintf(output_file, "%s:NAO_ENCONTRADA\n", users[i].login);
+            fprintf(arquivoSaida, "%s:NOT_FOUND\n", usuariosAlvo[i].login);
         }
     }
-    fclose(output_file);
+    fclose(arquivoSaida);
+    
+    // LIMPEZA FINAL
+    // to liberando tudo que alocou, cada malloc precisa de um free correspondente.
+    free(vetorThreads);
+    free(argumentosThreads);
+    free(usuariosAlvo);
 
-    printf("Operacao concluida com sucesso. Resultados guardados em '%s'.\n", argv[2]);
-    return 0;
+    return 0; 
 }
