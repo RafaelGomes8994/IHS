@@ -7,7 +7,7 @@
     fmt_dec:        .asciz "%d"             # para qtd imagens e m
     fmt_char:       .asciz "%c"
     fmt_newline:    .asciz "\n"
-    fmt_comp_rate:  .asciz "[%d%%]\n"
+    fmt_comp_rate:  .asciz "[%d.%02d%%]\n"
 
     mode_r:         .asciz "r"              
     mode_w:         .asciz "w"              
@@ -31,8 +31,35 @@
 .section .text
 .global main
 
+.macro LER_TEMP_DO_INPUT fmt_label
+    MOV rdi, QWORD PTR [rip + inputF]
+    LEA rsi, [rip + \fmt_label]
+    LEA rdx, [rip + temp_val]
+    XOR eax, eax
+    CALL fscanf@plt
+.endm
+
+.macro SALVAR_TEMP_NA_TRIPLA triple_label, idx_reg
+    MOV eax, DWORD PTR [rip + temp_val]
+    LEA r8, [rip + \triple_label]
+    MOV DWORD PTR [r8 + \idx_reg*4], eax
+.endm
+
+.macro LER_E_SALVAR_TRIPLA fmt_label, triple_label, idx_reg, fail_lbl
+    MOV rdi, QWORD PTR [rip + inputF]
+    LEA rsi, [rip + \fmt_label]
+    LEA rdx, [rip + temp_val]
+    XOR eax, eax
+    CALL fscanf@plt
+    CMP eax, 1
+    JNE \fail_lbl
+    MOV eax, DWORD PTR [rip + temp_val]
+    LEA r8, [rip + \triple_label]
+    MOV DWORD PTR [r8 + \idx_reg*4], eax
+.endm
+
 main:
-    # prologo e abrir ficheiros
+    # prologo 
     PUSH rbp
     MOV rbp, rsp
     PUSH rbx
@@ -66,11 +93,7 @@ main:
 .ler_paleta:
     CMP r12, 16
     JGE .fim_paleta
-    MOV rdi, QWORD PTR [rip + inputF]   
-    LEA rsi, [rip + fmt_hex]            
-    LEA rdx, [rip + temp_val]           
-    XOR eax, eax                        
-    CALL fscanf@plt
+    LER_TEMP_DO_INPUT fmt_hex
     CMP eax, 1
     JNE .fim_programa
     MOV al, BYTE PTR [rip + temp_val]
@@ -81,11 +104,7 @@ main:
 .fim_paleta:
 
     # 2. ler quantidade de imagens (decimal %d)
-    MOV rdi, QWORD PTR [rip + inputF]
-    LEA rsi, [rip + fmt_dec]            
-    LEA rdx, [rip + temp_val]
-    XOR eax, eax
-    CALL fscanf@plt
+    LER_TEMP_DO_INPUT fmt_dec
     CMP eax, 1
     JNE .fim_programa
     MOV eax, DWORD PTR [rip + temp_val]
@@ -97,11 +116,7 @@ main:
     JLE .fim_programa
 
     # le a quant de triplas 'm' (decimal %d)
-    MOV rdi, QWORD PTR [rip + inputF]
-    LEA rsi, [rip + fmt_dec]            
-    LEA rdx, [rip + temp_val]
-    XOR eax, eax
-    CALL fscanf@plt
+    LER_TEMP_DO_INPUT fmt_dec
     CMP eax, 1
     JNE .fim_programa
     
@@ -121,46 +136,10 @@ main:
     CMP r14d, eax
     JGE .processar
 
-    # --- ler x (hexadecimal %x) ---
-    MOV rdi, QWORD PTR [rip + inputF]
-    LEA rsi, [rip + fmt_hex]
-    LEA rdx, [rip + temp_val]
-    XOR eax, eax
-    CALL fscanf@plt
-    CMP eax, 1
-    JNE .processar
-    
-    MOV eax, DWORD PTR [rip + temp_val]
-    LEA r8, [rip + triplas_x]       
-    MOV DWORD PTR [r8 + r14*4], eax
-
-.ler_y:
-    # --- ler y (hexadecimal %x) ---
-    MOV rdi, QWORD PTR [rip + inputF]
-    LEA rsi, [rip + fmt_hex]
-    LEA rdx, [rip + temp_val]
-    XOR eax, eax
-    CALL fscanf@plt
-    CMP eax, 1
-    JNE .processar
-    
-    MOV eax, DWORD PTR [rip + temp_val]
-    LEA r8, [rip + triplas_y]
-    MOV DWORD PTR [r8 + r14*4], eax
-
-.ler_b:
-    # --- ler b (hexadecimal %x) ---
-    MOV rdi, QWORD PTR [rip + inputF]
-    LEA rsi, [rip + fmt_hex]
-    LEA rdx, [rip + temp_val]
-    XOR eax, eax
-    CALL fscanf@plt
-    CMP eax, 1
-    JNE .processar
-    
-    MOV eax, DWORD PTR [rip + temp_val]
-    LEA r8, [rip + triplas_b]
-    MOV DWORD PTR [r8 + r14*4], eax
+    # --- ler x, y e b (hexadecimal %x) e salvar direto nas triplas ---
+    LER_E_SALVAR_TRIPLA fmt_hex, triplas_x, r14, .processar
+    LER_E_SALVAR_TRIPLA fmt_hex, triplas_y, r14, .processar
+    LER_E_SALVAR_TRIPLA fmt_hex, triplas_b, r14, .processar
 
 
     MOV r9d, eax                      # r9d = b lido
@@ -256,13 +235,16 @@ main:
 
     # taxa de compressao = (bytes lidos * 100) / area
     MOV rax, rbx                    
-    IMUL rax, 100                   
-    
+    IMUL rax, 100
+    SHL rax, 1                    
     MOV rcx, r9                     
     TEST rcx, rcx                   
     JZ .taxa_zero
     XOR rdx, rdx                    
-    DIV rcx                         
+    DIV rcx
+    ADD rax, 1 
+    SHR rax, 1
+
     JMP .print_taxa
 
 .taxa_zero:
@@ -271,7 +253,29 @@ main:
 .print_taxa:
     MOV rdi, QWORD PTR [rip + outputF]  
     LEA rsi, [rip + fmt_comp_rate]      
-    MOV rdx, rax                        
+    MOV rax, rbx                        
+    IMUL rax, 10000                     
+    MOV rcx, r9                         
+    TEST rcx, rcx                       
+    JZ .taxa_zero_print                 
+    MOV r11, rcx                        
+    SHR r11, 1                          
+    ADD rax, r11                        
+    XOR rdx, rdx                        
+    DIV rcx                             
+    JMP .taxa_split                     
+
+.taxa_zero_print:
+    XOR rax, rax                        
+
+.taxa_split:
+    MOV rcx, 100                        
+    XOR rdx, rdx                        
+    DIV rcx                             
+    MOV r10, rax                        
+    MOV r11, rdx                        
+    MOV rdx, r10                        
+    MOV rcx, r11                        
     XOR eax, eax                    
     CALL fprintf@plt
 
@@ -311,11 +315,6 @@ main:
     JMP .print_y
 
 .fim_imagem:
-    MOV rdi, QWORD PTR [rip + outputF]
-    LEA rsi, [rip + fmt_newline]
-    XOR eax, eax
-    CALL fprintf@plt
-
     # subtrai 1 a qtd de imagens e recomeça o ciclo
     MOV eax, DWORD PTR [rip + qtd_imagens]
     DEC eax
@@ -345,4 +344,3 @@ main:
     POP rbp
     MOV eax, 0
     RET
-

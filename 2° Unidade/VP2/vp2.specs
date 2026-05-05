@@ -1,0 +1,8 @@
+*link:
+-T vp2.ld
+
+*startfile:
+start.o
+
+*lib:
+-lc
