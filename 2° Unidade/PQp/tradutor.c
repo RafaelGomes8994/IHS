@@ -79,8 +79,9 @@ void* memTeste = NULL;
 
 uint32_t PQP_REGS[16] = {0};
 uint8_t* PICO_MEM = NULL;
-uint32_t mapa_frequencias[256] = {0};
-
+uint32_t translation_order[256];
+char translated_strings[256][64];
+uint32_t num_translated = 0;
 
 typedef struct {
     uint8_t* code;
@@ -188,60 +189,29 @@ static inline void apdC_InsertEnderecoJmp (int32_t imm32){
 }
 
 
-static inline void apdC_InsertCounter (uint8_t index){
-    apdC(0x66); apdC(0x0F); apdC(0xFE);
+static inline void apdC_InsertCounter(uint32_t PC) {
+    uint32_t inst_idx = PC / 4;
+    uint32_t xmm_reg = inst_idx / 4;
+    uint32_t slot_idx = inst_idx % 4;
 
-    apdC(0x04 + ((index / 4) << 3)); apdC(0x25);
-
-    uint32_t* temp [4] = {const_1_0_0_0, const_0_1_0_0, const_0_0_1_0, const_0_0_0_1};
-
-    apdC_PTR32((uint32_t) (uint64_t) temp[((index % 4))]);
-
-}
-void calcular_frequencias_pqp() {
-    uint32_t pc_emu = 0;
-    uint32_t regs_emu[16] = {0};
-    uint8_t flags_emu = 0; // 4: GREATER, 2: LESS, 1: EQUAL
-
-    while (pc_emu < 256) {
-        uint8_t opcode = PICO_MEM[pc_emu];
-        
-        // Incrementa a contagem de execução real deste endereço
-        mapa_frequencias[pc_emu]++;
-
-        uint8_t reg0 = PICO_MEM[pc_emu + 1] >> 4;
-        uint8_t reg1 = PICO_MEM[pc_emu + 1] & 0x0F;
-        int16_t imm16 = *(int16_t*)&PICO_MEM[pc_emu + 2];
-        uint32_t proximo_pc = pc_emu + 4;
-
-        switch (opcode) {
-            case 0x00: regs_emu[reg0] = (int32_t)imm16; break;
-            case 0x01: regs_emu[reg0] = regs_emu[reg1]; break;
-            case 0x02: regs_emu[reg0] = *(uint32_t*)&PICO_MEM[regs_emu[reg1] & 0xFF]; break;
-            case 0x03: *(uint32_t*)&PICO_MEM[regs_emu[reg0] & 0xFF] = regs_emu[reg1]; break;
-            case 0x04:
-                flags_emu = 0;
-                if (regs_emu[reg0] > regs_emu[reg1]) flags_emu |= 4;
-                if (regs_emu[reg0] < regs_emu[reg1]) flags_emu |= 2;
-                if (regs_emu[reg0] == regs_emu[reg1]) flags_emu |= 1;
-                break;
-            case 0x05: proximo_pc = pc_emu + 4 + imm16; break;
-            case 0x06: if (flags_emu & 4) proximo_pc = pc_emu + 4 + imm16; break;
-            case 0x07: if (flags_emu & 2) proximo_pc = pc_emu + 4 + imm16; break;
-            case 0x08: if (flags_emu & 1) proximo_pc = pc_emu + 4 + imm16; break;
-            case 0x09: regs_emu[reg0] += regs_emu[reg1]; break;
-            case 0x0A: regs_emu[reg0] -= regs_emu[reg1]; break;
-            case 0x0B: regs_emu[reg0] &= regs_emu[reg1]; break;
-            case 0x0C: regs_emu[reg0] |= regs_emu[reg1]; break;
-            case 0x0D: regs_emu[reg0] ^= regs_emu[reg1]; break;
-            case 0x0E: regs_emu[reg0] <<= (PICO_MEM[pc_emu + 3] & 0x1F); break;
-            case 0x0F: regs_emu[reg0] = (int32_t)regs_emu[reg0] >> (PICO_MEM[pc_emu + 3] & 0x1F); break;
-            default: proximo_pc = 999; break; // Opcode inválido ou fim abrupto
-        }
-
-        if (proximo_pc >= 256) break;
-        pc_emu = proximo_pc;
+    if (xmm_reg < 8) {
+        // Caso normal (xmm0-xmm7): A instrução RIP-Relativa tem 8 bytes.
+        // Injetamos 1 NOP para manter cravado em 9 bytes!
+        apdC(0x90); 
+        apdC(0x66); apdC(0x0F); apdC(0xFE);
+        apdC((xmm_reg << 3) | 0x05); // ModRM: 05 = RIP-Relativo (sem byte SIB)
+    } else {
+        // Seu Caso Especial (xmm8-xmm15): A instrução ganha o REX, somando exatos 9 bytes!
+        apdC(0x66); apdC(0x44); apdC(0x0F); apdC(0xFE); // 0x44 = Prefixo REX
+        apdC(((xmm_reg - 8) << 3) | 0x05); // ModRM: 05 = RIP-Relativo
     }
+
+    uint32_t* temp[4] = {const_1_0_0_0, const_0_1_0_0, const_0_0_1_0, const_0_0_0_1};
+    
+    // Distância exata da instrução até a constante na memória
+    uint8_t* next_rip = codeMemory.code + codeMemory.pos + 4;
+    int32_t disp32 = (int32_t)((uint8_t*)temp[slot_idx] - next_rip);
+    apdC_PTR32((uint32_t)disp32);
 }
 
 void printCode(){
@@ -306,9 +276,8 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
     uint32_t PC = instCount << 2;
     uint8_t opcode = PICO_MEM[PC];
 
-    // Pega o cálculo prévio gerado e substitui o valor fixo
-    uint32_t contagem_calculada = mapa_frequencias[PC];
-    fprintf(outputF, "%u:%04x:", contagem_calculada, PC);
+
+    translation_order[num_translated++] = PC;
 
     setApdCAddress((rip) - 1 -  (uint64_t) codeMemory.code);
     
@@ -319,14 +288,14 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
     printf("\ndeslocamento: %llu\n", codeMemory.pos);
     printf("-----------------------------------------------------\n");    
 
-    apdC_InsertCounter(opcode); //7 bytes
+    apdC_InsertCounter(PC); //7 bytes
     switch (opcode) {
         case 0x00:
             {
                 uint8_t reg0Index = PICO_MEM[PC+1]>>4;
                 int16_t immValue = *((int16_t*) &PICO_MEM[PC+2]);
 
-                fprintf(outputF, "mov_r%u=%08x\n", reg0Index, (int32_t)immValue);
+                sprintf(translated_strings[PC], "mov_r%u=%08x\n", reg0Index, (int32_t)immValue);
                 printf("[instrucao] \t mov_r%u=%08x\n", reg0Index, (int32_t) immValue);
 
                 if (reg0Index <= 7){
@@ -349,7 +318,7 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
                 uint8_t reg1Index = PICO_MEM[PC+1] & 0xF;
 
                 printf("[instrucao] \t mov_r%u=r%u\n", reg0Index, reg1Index);
-                fprintf(outputF, "mov_r%u=r%u\n", reg0Index, reg1Index);
+                sprintf(translated_strings[PC], "mov_r%u=r%u\n", reg0Index, reg1Index);
 
                 IF_REGISTERS(
                     apdC(0x89); apdC(0xC0 + reg0Index + (reg1Index << 3));
@@ -375,7 +344,7 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
                 uint8_t reg1Index = PICO_MEM[PC+1] & 0xF;
 
                 printf("[instrucao] \t mov_r%u=[r%u]\n", reg0Index, reg1Index);
-                fprintf(outputF, "mov_r%u=[r%u]\n", reg0Index, reg1Index);
+                sprintf(translated_strings[PC], "mov_r%u=[r%u]\n", reg0Index, reg1Index);
 
                 IF_REGISTERS_MEM(
                     apdC(0x8B); apdC(0x80 + reg1Index + (reg0Index << 3)); insertPICO_MEM(PICO_MEM);
@@ -398,7 +367,7 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
                 uint8_t reg1Index = PICO_MEM[PC+1] & 0xF;
 
                 printf("[instrucao] \t mov_[r%u]=r%u\n", reg0Index, reg1Index);
-                fprintf(outputF, "mov_[r%u]=r%u\n", reg0Index, reg1Index);
+                sprintf(translated_strings[PC], "mov_[r%u]=r%u\n", reg0Index, reg1Index);
 
                 IF_REGISTERS(
                     apdC(0x89); apdC(0x80 + reg0Index + (reg1Index << 3)); insertPICO_MEM(PICO_MEM);
@@ -421,7 +390,7 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
                 uint8_t reg1Index = PICO_MEM[PC+1] & 0xF;
 
                 printf("[instrucao] \t cmp_r%u<=>r%u\n", reg0Index, reg1Index);
-                fprintf(outputF, "cmp_r%u<=>r%u\n", reg0Index, reg1Index);
+                sprintf(translated_strings[PC], "cmp_r%u<=>r%u\n", reg0Index, reg1Index);
 
                 IF_REGISTERS(
                     apdC(0x39); apdC(0xC0 + reg0Index + (reg1Index << 3));
@@ -457,11 +426,11 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
 
                 if (PC_target >= 0xFF) {
                     printf("[instrucao] \t jmp_\n");
-                    fprintf(outputF, "jmp_%04x\n", PC_target);
+                    sprintf(translated_strings[PC], "jmp_%04x\n", PC_target);
                 }
                 else {
                     printf("[instrucao] \t jmp_%04x\n", PC_target);
-                    fprintf(outputF, "jmp_%04x\n", PC_target);
+                    sprintf(translated_strings[PC], "jmp_%04x\n", PC_target);
                 }
 
                 ctx->uc_mcontext.gregs[REG_RIP] = (uint64_t) &codeMemory.code[codeMemory.pos - 16];
@@ -481,8 +450,8 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
                 apdC_InsertEnderecoJmp(rel32);
                 apdC(0x90); 
 
-                printf("[instrucao] \t jg_%04x\n", PC_target);
-                fprintf(outputF, "jg_%04x\n", PC_target);
+                printf( "[instrucao] \t jg_%04x\n", PC_target);
+                sprintf(translated_strings[PC], "jg_%04x\n", PC_target);
 
                 ctx->uc_mcontext.gregs[REG_RIP] = (uint64_t) &codeMemory.code[codeMemory.pos - 16];
             }
@@ -502,8 +471,8 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
                 apdC(0x90); 
 
                 printf("[instrucao] \t jl_%04x\n", PC_target);
-                fprintf(outputF, "jl_%04x\n", PC_target);
-                
+                sprintf(translated_strings[PC], "jl_%04x\n", PC_target);
+
                 ctx->uc_mcontext.gregs[REG_RIP] = (uint64_t) &codeMemory.code[codeMemory.pos - 16];
             }
             break;
@@ -522,8 +491,8 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
                 apdC(0x90); 
 
                 printf("[instrucao] \t je_%04x\n", PC_target);
-                fprintf(outputF, "je_%04x\n", PC_target);
-                
+                sprintf(translated_strings[PC], "je_%04x\n", PC_target);
+
                 ctx->uc_mcontext.gregs[REG_RIP] = (uint64_t) &codeMemory.code[codeMemory.pos - 16];
             }
             break;
@@ -534,7 +503,7 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
                 uint8_t reg1Index = PICO_MEM[PC+1] & 0xF;
 
                 printf("add_r%u+=r%u\n", reg0Index, reg1Index);
-                fprintf(outputF, "add_r%u+=r%u\n", reg0Index, reg1Index);
+                sprintf(translated_strings[PC], "add_r%u+=r%u\n", reg0Index, reg1Index);
 
                 IF_REGISTERS(
                     apdC(0x01); apdC(0xC0 + reg0Index + (reg1Index << 3));
@@ -560,7 +529,7 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
                 uint8_t reg1Index = PICO_MEM[PC+1] & 0xF;
 
                 printf("sub_r%u-=r%u\n", reg0Index, reg1Index);
-                fprintf(outputF, "sub_r%u-=r%u\n", reg0Index, reg1Index);
+                sprintf(translated_strings[PC], "sub_r%u-=r%u\n", reg0Index, reg1Index);
 
                 IF_REGISTERS(
                     apdC(0x29); apdC(0xC0 + reg0Index + (reg1Index << 3));
@@ -586,7 +555,7 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
                 uint8_t reg1Index = PICO_MEM[PC+1] & 0xF;
 
                 printf("and_r%u&=r%u\n", reg0Index, reg1Index);
-                fprintf(outputF, "and_r%u&=r%u\n", reg0Index, reg1Index);
+                sprintf(translated_strings[PC], "and_r%u&=r%u\n", reg0Index, reg1Index);
 
                 IF_REGISTERS(
                     apdC(0x21); apdC(0xC0 + reg0Index + (reg1Index << 3));
@@ -612,7 +581,7 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
                 uint8_t reg1Index = PICO_MEM[PC+1] & 0xF;
 
                 printf("or_r%u|=r%u\n", reg0Index, reg1Index);
-                fprintf(outputF, "or_r%u|=r%u\n", reg0Index, reg1Index);
+                sprintf(translated_strings[PC], "or_r%u|=r%u\n", reg0Index, reg1Index);
 
                 IF_REGISTERS(
                     apdC(0x09); apdC(0xC0 + reg0Index + (reg1Index << 3));
@@ -638,7 +607,7 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
                 uint8_t reg1Index = PICO_MEM[PC+1] & 0xF;
 
                 printf("xor_r%u^=r%u\n", reg0Index, reg1Index);
-                fprintf(outputF, "xor_r%u^=r%u\n", reg0Index, reg1Index);
+                sprintf(translated_strings[PC], "xor_r%u^=r%u\n", reg0Index, reg1Index);
 
                 IF_REGISTERS(
                     apdC(0x31); apdC(0xC0 + reg0Index + (reg1Index << 3));
@@ -664,7 +633,7 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
                 uint8_t slImm = PICO_MEM[PC+3] & 0xF;
 
                 printf("sal_r%u<<=%u\n", reg0Index, slImm);
-                fprintf(outputF, "sal_r%u<<=%u\n", reg0Index, slImm);
+                sprintf(translated_strings[PC], "sal_r%u<<=%u\n", reg0Index, slImm);
 
                 if (reg0Index < 8){
                     apdC(0xC1); apdC(0xE0 + reg0Index); apdC(slImm);
@@ -685,7 +654,7 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
                 uint8_t slImm = PICO_MEM[PC+3] & 0xF;
 
                 printf("sar_r%u>>=%u\n", reg0Index, slImm);
-                fprintf(outputF, "sar_r%u>>=%u\n", reg0Index, slImm);
+                sprintf(translated_strings[PC], "sar_r%u>>=%u\n", reg0Index, slImm);
 
                 if (reg0Index < 8){
                     apdC(0xC1); apdC(0xF8 + reg0Index); apdC(slImm);
@@ -723,16 +692,24 @@ void end (int32_t sig, siginfo_t *si, void* context){
 
     printf("rip: %04X\n", rip);
     printf("Instcount: %04X\n", instCount);
-    uint32_t PC = instCount << 2;
+    uint32_t PC_exit = instCount << 2;
     printf("Info: %d\n", si->si_addr);
 
-    fprintf(outputF, "-:%04x:exit\n", PC);
+    // Busca os contadores direto do silício (XMM Registers)
+    uint8_t *fp = (uint8_t *)ctx->uc_mcontext.fpregs;
+    uint32_t *xmm_space = (uint32_t *)(fp + 160);
+
+    for (uint32_t i = 0; i < num_translated; i++) {
+        uint32_t pc = translation_order[i];
+        uint32_t contagem_real = xmm_space[pc / 4];
+        fprintf(outputF, "%u:%04x:%s", contagem_real, pc, translated_strings[pc]);
+    }
+
+    fprintf(outputF, "-:%04x:exit\n", PC_exit + 1);
     printRegs(ctx);
 
 
-    struct _libc_fpstate* fp = ctx->uc_mcontext.fpregs;
     
-
 
     fprintf(outputF, "\n");
     for (int i = 0; i < 15; i++){
@@ -793,9 +770,6 @@ int main (int argc, char* argv[]){
     const_0_0_0_1 = (uint32_t*) mmap(targetAddr5, 4*4, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
 
     
-
-
-    
     const_1_0_0_0[0] = 1;
     const_1_0_0_0[1] = 0;
     const_1_0_0_0[2] = 0;
@@ -831,25 +805,21 @@ int main (int argc, char* argv[]){
 
     }
 
-    //codeMemory.code = (uint8_t*) malloc(posof(uint8_t) * counter * 10);
-    codeMemory.code = (uint8_t*) mmap(NULL, SIZE_INITIAL_CODE+(counter<<2), PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+// Substitua o seu mmap atual por este bloco vizinho:
+    void* targetAddrJIT = (void*)(0x10007000);
+    codeMemory.code = (uint8_t*) mmap(targetAddrJIT, SIZE_INITIAL_CODE+(counter<<2), PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    
     memset(codeMemory.code, 0xCC, SIZE_INITIAL_CODE+(counter<<2));
 
     codeMemory.size = SIZE_INITIAL_CODE+(counter<<2);
-// --- CORREÇÃO DO BUG: Salva e restaura a PICO_MEM pro JIT ---
-    uint8_t pico_mem_backup[256];
-    memcpy(pico_mem_backup, PICO_MEM, 256); // Faz o backup dos bytes originais
 
-    calcular_frequencias_pqp(); // Roda o emulador para preencher o mapa
-
-    memcpy(PICO_MEM, pico_mem_backup, 256); // Devolve a memória intacta para o JIT
-    // ---
     
 
     memcpy(codeMemory.code, initialCode, SIZE_INITIAL_CODE);
 
 
     void (*func)() = (void*) codeMemory.code;
+
     
     func();
 
