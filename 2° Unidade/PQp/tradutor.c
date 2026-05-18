@@ -79,6 +79,7 @@ void* memTeste = NULL;
 
 uint32_t PQP_REGS[16] = {0};
 uint8_t* PICO_MEM = NULL;
+uint32_t mapa_frequencias[256] = {0};
 
 
 typedef struct {
@@ -197,6 +198,51 @@ static inline void apdC_InsertCounter (uint8_t index){
     apdC_PTR32((uint32_t) (uint64_t) temp[((index % 4))]);
 
 }
+void calcular_frequencias_pqp() {
+    uint32_t pc_emu = 0;
+    uint32_t regs_emu[16] = {0};
+    uint8_t flags_emu = 0; // 4: GREATER, 2: LESS, 1: EQUAL
+
+    while (pc_emu < 256) {
+        uint8_t opcode = PICO_MEM[pc_emu];
+        
+        // Incrementa a contagem de execução real deste endereço
+        mapa_frequencias[pc_emu]++;
+
+        uint8_t reg0 = PICO_MEM[pc_emu + 1] >> 4;
+        uint8_t reg1 = PICO_MEM[pc_emu + 1] & 0x0F;
+        int16_t imm16 = *(int16_t*)&PICO_MEM[pc_emu + 2];
+        uint32_t proximo_pc = pc_emu + 4;
+
+        switch (opcode) {
+            case 0x00: regs_emu[reg0] = (int32_t)imm16; break;
+            case 0x01: regs_emu[reg0] = regs_emu[reg1]; break;
+            case 0x02: regs_emu[reg0] = *(uint32_t*)&PICO_MEM[regs_emu[reg1] & 0xFF]; break;
+            case 0x03: *(uint32_t*)&PICO_MEM[regs_emu[reg0] & 0xFF] = regs_emu[reg1]; break;
+            case 0x04:
+                flags_emu = 0;
+                if (regs_emu[reg0] > regs_emu[reg1]) flags_emu |= 4;
+                if (regs_emu[reg0] < regs_emu[reg1]) flags_emu |= 2;
+                if (regs_emu[reg0] == regs_emu[reg1]) flags_emu |= 1;
+                break;
+            case 0x05: proximo_pc = pc_emu + 4 + imm16; break;
+            case 0x06: if (flags_emu & 4) proximo_pc = pc_emu + 4 + imm16; break;
+            case 0x07: if (flags_emu & 2) proximo_pc = pc_emu + 4 + imm16; break;
+            case 0x08: if (flags_emu & 1) proximo_pc = pc_emu + 4 + imm16; break;
+            case 0x09: regs_emu[reg0] += regs_emu[reg1]; break;
+            case 0x0A: regs_emu[reg0] -= regs_emu[reg1]; break;
+            case 0x0B: regs_emu[reg0] &= regs_emu[reg1]; break;
+            case 0x0C: regs_emu[reg0] |= regs_emu[reg1]; break;
+            case 0x0D: regs_emu[reg0] ^= regs_emu[reg1]; break;
+            case 0x0E: regs_emu[reg0] <<= (PICO_MEM[pc_emu + 3] & 0x1F); break;
+            case 0x0F: regs_emu[reg0] = (int32_t)regs_emu[reg0] >> (PICO_MEM[pc_emu + 3] & 0x1F); break;
+            default: proximo_pc = 999; break; // Opcode inválido ou fim abrupto
+        }
+
+        if (proximo_pc >= 256) break;
+        pc_emu = proximo_pc;
+    }
+}
 
 void printCode(){
 
@@ -251,12 +297,6 @@ void printRegs(ucontext_t* ctx){
     printf("-----------------------------------------------------\n");
 }
 
-
-
-//Vou tentar fazer algo parecido com um debugger/compilador real
-//Uma função de fallback vai ser responsável por pegar o sinal SIGTRAP e iniciar a nova compilação de código
-
-
 void fallback (int32_t sig, siginfo_t *si, void* context){
     
     ucontext_t* ctx = (ucontext_t*) context;
@@ -266,8 +306,9 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
     uint32_t PC = instCount << 2;
     uint8_t opcode = PICO_MEM[PC];
 
-    // O contador aqui sairá fixo (0 ou 1) pois estamos na compilação.
-    fprintf(outputF, "%u:%04x:", , PC);
+    // Pega o cálculo prévio gerado e substitui o valor fixo
+    uint32_t contagem_calculada = mapa_frequencias[PC];
+    fprintf(outputF, "%u:%04x:", contagem_calculada, PC);
 
     setApdCAddress((rip) - 1 -  (uint64_t) codeMemory.code);
     
@@ -685,7 +726,7 @@ void end (int32_t sig, siginfo_t *si, void* context){
     uint32_t PC = instCount << 2;
     printf("Info: %d\n", si->si_addr);
 
-    fprintf(outputF, "-:%04x:exit\n", PC & 0xFFFFFFFFFFFF);
+    fprintf(outputF, "-:%04x:exit\n", PC);
     printRegs(ctx);
 
 
@@ -795,7 +836,14 @@ int main (int argc, char* argv[]){
     memset(codeMemory.code, 0xCC, SIZE_INITIAL_CODE+(counter<<2));
 
     codeMemory.size = SIZE_INITIAL_CODE+(counter<<2);
+// --- CORREÇÃO DO BUG: Salva e restaura a PICO_MEM pro JIT ---
+    uint8_t pico_mem_backup[256];
+    memcpy(pico_mem_backup, PICO_MEM, 256); // Faz o backup dos bytes originais
 
+    calcular_frequencias_pqp(); // Roda o emulador para preencher o mapa
+
+    memcpy(PICO_MEM, pico_mem_backup, 256); // Devolve a memória intacta para o JIT
+    // ---
     
 
     memcpy(codeMemory.code, initialCode, SIZE_INITIAL_CODE);
