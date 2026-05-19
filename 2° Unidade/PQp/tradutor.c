@@ -295,8 +295,8 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
                 uint8_t reg0Index = PICO_MEM[PC+1]>>4;
                 int16_t immValue = *((int16_t*) &PICO_MEM[PC+2]);
 
-                sprintf(translated_strings[PC], "mov_r%u=%08x\n", reg0Index, (int32_t)immValue);
-                printf("[instrucao] \t mov_r%u=%08x\n", reg0Index, (int32_t) immValue);
+                sprintf(translated_strings[PC], "mov_r%u,%08x\n", reg0Index, (int32_t)immValue);
+                printf("[instrucao] \t mov_r%u,%08x\n", reg0Index, (int32_t) immValue);
 
                 if (reg0Index <= 7){
                     apdC(0xb8 + reg0Index); apdC_InsertImm16(immValue);
@@ -317,8 +317,8 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
                 uint8_t reg0Index = PICO_MEM[PC+1] >> 4;
                 uint8_t reg1Index = PICO_MEM[PC+1] & 0xF;
 
-                printf("[instrucao] \t mov_r%u=r%u\n", reg0Index, reg1Index);
-                sprintf(translated_strings[PC], "mov_r%u=r%u\n", reg0Index, reg1Index);
+                printf("[instrucao] \t mov_r%u,r%u\n", reg0Index, reg1Index);
+                sprintf(translated_strings[PC], "mov_r%u,r%u\n", reg0Index, reg1Index);
 
                 IF_REGISTERS(
                     apdC(0x89); apdC(0xC0 + reg0Index + (reg1Index << 3));
@@ -343,8 +343,8 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
                 uint8_t reg0Index = PICO_MEM[PC+1]>>4;
                 uint8_t reg1Index = PICO_MEM[PC+1] & 0xF;
 
-                printf("[instrucao] \t mov_r%u=[r%u]\n", reg0Index, reg1Index);
-                sprintf(translated_strings[PC], "mov_r%u=[r%u]\n", reg0Index, reg1Index);
+                printf("[instrucao] \t mov_r%u,[r%u]\n", reg0Index, reg1Index);
+                sprintf(translated_strings[PC], "mov_r%u,[r%u]\n", reg0Index, reg1Index);
 
                 IF_REGISTERS_MEM(
                     apdC(0x8B); apdC(0x80 + reg1Index + (reg0Index << 3)); insertPICO_MEM(PICO_MEM);
@@ -366,8 +366,8 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
                 uint8_t reg0Index = PICO_MEM[PC+1]>>4;
                 uint8_t reg1Index = PICO_MEM[PC+1] & 0xF;
 
-                printf("[instrucao] \t mov_[r%u]=r%u\n", reg0Index, reg1Index);
-                sprintf(translated_strings[PC], "mov_[r%u]=r%u\n", reg0Index, reg1Index);
+                printf("[instrucao] \t mov_[r%u],r%u\n", reg0Index, reg1Index);
+                sprintf(translated_strings[PC], "mov_[r%u],r%u\n", reg0Index, reg1Index);
 
                 IF_REGISTERS(
                     apdC(0x89); apdC(0x80 + reg0Index + (reg1Index << 3)); insertPICO_MEM(PICO_MEM);
@@ -699,24 +699,54 @@ void end (int32_t sig, siginfo_t *si, void* context){
     uint8_t *fp = (uint8_t *)ctx->uc_mcontext.fpregs;
     uint32_t *xmm_space = (uint32_t *)(fp + 160);
 
+// 1. Descobrir a contagem máxima para o Padding
+    uint32_t max_count = 0;
+    for (uint32_t i = 0; i < num_translated; i++) {
+        uint32_t c = xmm_space[translation_order[i] / 4];
+        if (c > max_count) {
+            max_count = c;
+        }
+    }
+
+    // 2. Extrai exatamente quantas casas decimais o maior número tem
+    int max_digits = snprintf(NULL, 0, "%u", max_count);
+
+    // 3. Montar as strings de formatação absolutas!
+    char fmt_inst[64], fmt_exit[64];
+    sprintf(fmt_inst, "%%%du:%%04x:%%s", max_digits); 
+    sprintf(fmt_exit, "%%%ds:%%04x:exit\n\n", max_digits);
+
+    // 4. RESTAURANDO A ORDENAÇÃO (Ordem Crescente dos PCs)
+    for (uint32_t i = 0; i < num_translated; i++) {
+        for (uint32_t j = i + 1; j < num_translated; j++) {
+            if (translation_order[i] > translation_order[j]) {
+                uint32_t temp = translation_order[i];
+                translation_order[i] = translation_order[j];
+                translation_order[j] = temp;
+            }
+        }
+    }
+
+    // 5. Imprimir as strings usando a formatação cravada e na ordem correta
     for (uint32_t i = 0; i < num_translated; i++) {
         uint32_t pc = translation_order[i];
         uint32_t contagem_real = xmm_space[pc / 4];
-        fprintf(outputF, "%u:%04x:%s", contagem_real, pc, translated_strings[pc]);
+        
+        fprintf(outputF, fmt_inst, contagem_real, pc, translated_strings[pc]);
     }
 
-    fprintf(outputF, "-:%04x:exit\n", PC_exit + 1);
+    // Imprime o tracinho "-" do exit usando a mesma largura de espaços
+    fprintf(outputF, fmt_exit, "-", PC_exit);
     printRegs(ctx);
 
 
-    
 
     fprintf(outputF, "\n");
     for (int i = 0; i < 15; i++){
-        fprintf(outputF, "r%d=%08X,", i, ctx->uc_mcontext.gregs[REGS[i]]);
+        fprintf(outputF, "r%d=%08x,", i, ctx->uc_mcontext.gregs[REGS[i]]);
     }
 
-    fprintf(outputF, "r15=%08X\n", ctx->uc_mcontext.gregs[REGS[15]]);
+    fprintf(outputF, "r15=%08x\n", ctx->uc_mcontext.gregs[REGS[15]]);
 
     fclose(inputF);
     fclose(outputF);
