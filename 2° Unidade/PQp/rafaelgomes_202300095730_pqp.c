@@ -9,7 +9,7 @@
 #include <signal.h>
 #include <ucontext.h>
 
-#define SIZE_INITIAL_CODE 87
+#define SIZE_INITIAL_CODE 192
 
 #define IF_REGISTERS(codeBothOld, codeReg0Old, codeReg1Old, codeBothNew) \
     do { \
@@ -91,54 +91,43 @@ typedef struct {
 
 Code_t codeMemory = {0};
 
+
 uint8_t initialCode[SIZE_INITIAL_CODE] = {
-    // xor rax, rax
-    0x48, 0x31, 0xC0,
-    // xor rbx, rbx
-    0x48, 0x31, 0xDB,
-    // xor rcx, rcx
-    0x48, 0x31, 0xC9,
-    // xor rdx, rdx
-    0x48, 0x31, 0xD2,
-    // xor rsi, rsi
-    0x48, 0x31, 0xF6,
-    // xor rdi, rdi
-    0x48, 0x31, 0xFF,
-    // xor rbp, rbp
-    0x48, 0x31, 0xED,
-    // xor rsp, rsp
-    0x48, 0x31, 0xE4,
-    // xor r8, r8
-    0x4D, 0x31, 0xC0,
-    // xor r9, r9
-    0x4D, 0x31, 0xC9,
-    // xor r10, r10
-    0x4D, 0x31, 0xD2,
-    // xor r11, r11
-    0x4D, 0x31, 0xDB,
-    // xor r12, r12
-    0x4D, 0x31, 0xE4,
-    // xor r13, r13
-    0x4D, 0x31, 0xED,
-    // xor r14, r14
-    0x4D, 0x31, 0xF6,
-    // xor r15, r15
-    0x4D, 0x31, 0xFF,
+    // xor de todos os GPRs (48 bytes)
+    0x48, 0x31, 0xC0, 0x48, 0x31, 0xDB, 0x48, 0x31, 0xC9, 0x48, 0x31, 0xD2,
+    0x48, 0x31, 0xF6, 0x48, 0x31, 0xFF, 0x48, 0x31, 0xED, 0x48, 0x31, 0xE4,
+    0x4D, 0x31, 0xC0, 0x4D, 0x31, 0xC9, 0x4D, 0x31, 0xD2, 0x4D, 0x31, 0xDB,
+    0x4D, 0x31, 0xE4, 0x4D, 0x31, 0xED, 0x4D, 0x31, 0xF6, 0x4D, 0x31, 0xFF,
 
-    // Limpar estado FPU/SSE primeiro
-    0x9B, 0xDB, 0xE2,  // fninit (limpa estado FPU)
+    // fninit - limpar unidade de ponto flutuante (3 bytes)
+    0x9B, 0xDB, 0xE2,
     
-    // pxor para todos os 16 registradores XMM
-    0x66, 0x0F, 0xEF, 0xC0,  // pxor xmm0, xmm0
-    0x66, 0x0F, 0xEF, 0xC9,  // pxor xmm1, xmm1  
-    0x66, 0x0F, 0xEF, 0xD2,  // pxor xmm2, xmm2
-    0x66, 0x0F, 0xEF, 0xDB,  // pxor xmm3, xmm3
-    0x66, 0x44, 0x0F, 0xEF, 0xC0,  // pxor xmm8, xmm8
-    0x66, 0x44, 0x0F, 0xEF, 0xC9,  // pxor xmm9, xmm9
-    0x66, 0x44, 0x0F, 0xEF, 0xD2,  // pxor xmm10, xmm10
-    0x66, 0x44, 0x0F, 0xEF, 0xDB   // pxor xmm11, xmm11
-};
+    // pxor xmm0 a xmm7 (32 bytes) - Zera os 8 primeiros
+    0x66, 0x0F, 0xEF, 0xC0, 0x66, 0x0F, 0xEF, 0xC9, 
+    0x66, 0x0F, 0xEF, 0xD2, 0x66, 0x0F, 0xEF, 0xDB,
+    0x66, 0x0F, 0xEF, 0xE4, 0x66, 0x0F, 0xEF, 0xED,
+    0x66, 0x0F, 0xEF, 0xF6, 0x66, 0x0F, 0xEF, 0xFF,
 
+    // pxor xmm8 a xmm15 (40 bytes) - CORRIGIDO: Agora usa o REX 0x45!
+    0x66, 0x45, 0x0F, 0xEF, 0xC0, 0x66, 0x45, 0x0F, 0xEF, 0xC9,
+    0x66, 0x45, 0x0F, 0xEF, 0xD2, 0x66, 0x45, 0x0F, 0xEF, 0xDB,
+    0x66, 0x45, 0x0F, 0xEF, 0xE4, 0x66, 0x45, 0x0F, 0xEF, 0xED,
+    0x66, 0x45, 0x0F, 0xEF, 0xF6, 0x66, 0x45, 0x0F, 0xEF, 0xFF,
+
+    // O PULO DO GATO: Salto incondicional de 64 bytes (0xEB, 0x40)
+    // Ele pula a área de dados abaixo e aterrissa exatamante no offset 192!
+    0x90, 0x90, 0x90, 0xEB, 0x40,
+
+    // Constantes embutidas a partir do offset 128 (64 bytes totais)
+    // Slot 0 (Offset 128)
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // Slot 1 (Offset 144)
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // Slot 2 (Offset 160)
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // Slot 3 (Offset 176)
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00
+};
 
 
 
@@ -267,7 +256,7 @@ void printRegs(ucontext_t* ctx){
     // printf("-----------------------------------------------------\n");
 }
 
-void fallback (int32_t sig, siginfo_t *si, void* context){
+void magianegra (int32_t sig, siginfo_t *si, void* context){
     
     ucontext_t* ctx = (ucontext_t*) context;
     
@@ -281,7 +270,7 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
 
     setApdCAddress((rip) - 1 -  (uint64_t) codeMemory.code);
     
-    // printf("\n[fallback chamado!]\n\n");
+    // printf("\n[magianegra chamado!]\n\n");
 
     // printf("contexto pqp ----------------------------------------\n");
     // printf("line: %04u\t pc: %04x\t opcode: %02x\t", PC / 4 + 1, PC, opcode);
@@ -418,7 +407,7 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
                 apdC(0xE9); 
 
                 uint8_t * nextRip   = codeMemory.code + (codeMemory.pos + 4);
-                uint8_t * destRip   = codeMemory.code + SIZE_INITIAL_CODE + ((PC_target / 4) * 16);
+                uint8_t * destRip   = codeMemory.code + SIZE_INITIAL_CODE + (PC_target *4);
                 int32_t   rel32     = (int32_t)(destRip - nextRip);
                 apdC_InsertEnderecoJmp(rel32);
                 
@@ -445,7 +434,7 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
                 apdC(0x0F); apdC(0x8F);
 
                 uint8_t * nextRip   = codeMemory.code + (codeMemory.pos + 4);
-                uint8_t * destRip   = codeMemory.code + SIZE_INITIAL_CODE + ((PC_target / 4) * 16);
+                uint8_t * destRip   = codeMemory.code + SIZE_INITIAL_CODE + (PC_target *4);
                 int32_t   rel32     = (int32_t)(destRip - nextRip);
                 apdC_InsertEnderecoJmp(rel32);
                 apdC(0x90); 
@@ -465,7 +454,7 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
                 apdC(0x0F); apdC(0x8C);
 
                 uint8_t * nextRip   = codeMemory.code + (codeMemory.pos + 4);
-                uint8_t * destRip   = codeMemory.code + SIZE_INITIAL_CODE + ((PC_target / 4) * 16);
+                uint8_t * destRip   = codeMemory.code + SIZE_INITIAL_CODE + (PC_target *4);
                 int32_t   rel32     = (int32_t)(destRip - nextRip);
                 apdC_InsertEnderecoJmp(rel32);
                 apdC(0x90); 
@@ -485,7 +474,7 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
                 apdC(0x0F); apdC(0x84);
 
                 uint8_t * nextRip   = codeMemory.code + (codeMemory.pos + 4);
-                uint8_t * destRip   = codeMemory.code + SIZE_INITIAL_CODE + ((PC_target / 4) * 16);
+                uint8_t * destRip   = codeMemory.code + SIZE_INITIAL_CODE + (PC_target *4);
                 int32_t   rel32     = (int32_t)(destRip - nextRip);
                 apdC_InsertEnderecoJmp(rel32);
                 apdC(0x90); 
@@ -683,16 +672,15 @@ void fallback (int32_t sig, siginfo_t *si, void* context){
 }
 
 
-void end (int32_t sig, siginfo_t *si, void* context){
+void impressao_do_capeta (int32_t sig, siginfo_t *si, void* context){
     ucontext_t* ctx = (ucontext_t*) context;
     //printCode();
 
     uint64_t rip = (uint64_t) ctx->uc_mcontext.gregs[REG_RIP];
-    uint32_t instCount = ((rip) - (uint64_t) codeMemory.code - SIZE_INITIAL_CODE) >> 4; 
 
     // printf("rip: %04X\n", rip);
     // printf("Instcount: %04X\n", instCount);
-    uint32_t PC_exit = instCount << 2;
+    uint32_t PC_exit = ((rip) - (uint64_t) codeMemory.code - SIZE_INITIAL_CODE) >> 2;
     // printf("Info: %d\n", si->si_addr);
 
     // Busca os contadores direto do silício (XMM Registers)
@@ -779,12 +767,12 @@ int main (int argc, char* argv[]){
     sigaltstack(&ss, NULL);
 
     struct sigaction sa_jit = {0};
-    sa_jit.sa_sigaction = fallback;
+    sa_jit.sa_sigaction = magianegra;
     sa_jit.sa_flags = SA_ONSTACK | SA_SIGINFO | SA_RESTART;
     sigaction(SIGTRAP, &sa_jit, NULL);
 
     struct sigaction sa_end = {0};
-    sa_end.sa_sigaction = end;
+    sa_end.sa_sigaction = impressao_do_capeta;
     sa_end.sa_flags = SA_ONSTACK | SA_SIGINFO;
     sigaction(SIGSEGV, &sa_end, NULL);
 
@@ -849,9 +837,8 @@ int main (int argc, char* argv[]){
     memcpy(codeMemory.code, initialCode, SIZE_INITIAL_CODE);
 
 
+// Garanta que o JIT comece a rodar do início, para executar a faxina de registradores!
     void (*func)() = (void*) codeMemory.code;
-
-    
     func();
 
     
