@@ -1,46 +1,72 @@
 // =============================================================================
-// calculo_pwm.S — Cálculo de PWM em Assembly Xtensa LX6 (ESP32)
+// calculo_pwm.S — Cálculo de Duty Cycle PWM em Assembly Xtensa LX6
 // Projeto: Rover FPV | Disciplina: IHS — Prof. Bruno Prado / UFS
 //
-// ATENÇÃO: Renomear este arquivo de .asm para .S (S maiúsculo).
-// O PlatformIO/GAS processa arquivos .S pelo pré-processador C (cpp),
-// o que habilita: macros #define, comentários //, diretivas condicionais.
-// Arquivos .asm são ignorados pelo sistema de build do PlatformIO.
+// CORREÇÃO CRÍTICA — Windowed ABI vs CALL0 ABI
+// ─────────────────────────────────────────────
+// O Arduino/ESP32 compila C/C++ com a WINDOWED ABI do Xtensa (padrão GCC).
+// Toda função Assembly que é chamada por código C DEVE obedecer:
+//
+//   1. ENTRY A1, N    — Rotaciona a janela de registradores e aloca N bytes
+//                        de stack. SEM isso, o caller perde seus registradores.
+//
+//   2. RETW.N         — Restaura a janela de registradores e retorna.
+//                        NUNCA use RET.N com Windowed ABI: ele salta para A0
+//                        sem restaurar a janela, corrompendo o estado do caller
+//                        → Guru Meditation InstrFetchProhibited.
+//
+// Diagnóstico do crash anterior:
+//   EXCCAUSE=0x14 (InstrFetchProhibited) + A0==PC==0x800e7ad6 (inválido)
+//   Causa: RET.N saltou para A0 sem restaurar a janela. O A0 visível no
+//   contexto corrompido não era o return address real, era lixo da janela
+//   anterior. O CPU tentou executar de 0x800e7ad6 → pânico.
 //
 // Função: uint32_t calcularPWM(uint8_t entrada)
+//   Lógica: duty = entrada * 4
+//   Mapeia 0-255 para 0-1020 (≈ resolução 10-bit do ledc, range 0-1023)
+//   Exemplo: calcularPWM(200) = 800 = 78% de duty cycle
 //
-// Descrição:
-//   Converte um valor de entrada (0–255) em um valor de duty cycle
-//   para o periférico LEDC do ESP32 configurado em resolução 10 bits.
-//   A fórmula implementada é: saida = entrada * 4
-//
-//   Tabela de conversão:
-//     entrada=0   → saida=0    (motor parado)
-//     entrada=128 → saida=512  (~50% — meia velocidade)
-//     entrada=200 → saida=800  (~78% — velocidade de cruzeiro do rover)
-//     entrada=255 → saida=1020 (~99% — velocidade máxima)
-//
-//   Limite do LEDC 10-bit: 0–1023. O maior valor uint8_t (255) gera 1020.
-//   Não há risco de overflow para o tipo uint32_t retornado.
-//
-// ABI Xtensa (Windowed Register):
-//   a2 = primeiro argumento (entrada) E registrador de retorno
-//   a3 = registrador temporário (callee-saved? Não — usamos e restauramos)
-//   A função não usa o stack (sem prólogo/epílogo necessário).
+// Windowed ABI — fluxo de chamada CALL4:
+//   Caller:  a2 = argumento; CALL4 calcularPWM
+//   CPU:     rotaciona janela +4; A0_novo = return_address
+//   Callee:  ENTRY a1, 16 → aloca stack; A2 = argumento (preservado na rotação)
+//   Callee:  opera em A2, A3 (scratch da nova janela, não afeta o caller)
+//   Callee:  RETW.N → restaura janela; A2_caller = A2_callee (valor de retorno)
 // =============================================================================
 
     .global calcularPWM
-    .section .text.calcularPWM, "ax"    // Seção nomeada: permite dead-code strip
-    .align  4                            // Alinha a função em 4 bytes (Xtensa)
-    .type   calcularPWM, @function       // Metadado ELF: tipo função
+    .type   calcularPWM, @function
+    .section .text.calcularPWM, "ax", @progbits
 
 calcularPWM:
-    // a2 = entrada (uint8_t zero-extendido para 32 bits pelo compilador C)
+    // ------------------------------------------------------------------
+    // ENTRY: obrigatório na Windowed ABI.
+    // Rotaciona a janela de registradores e aloca 16 bytes de stack frame.
+    // 16 bytes é o mínimo exigido pelo ABI (alinhamento de 16 bytes).
+    // ------------------------------------------------------------------
+    entry   a1, 16
 
-    movi    a3, 4           // a3 ← 4 (multiplicador)
-    mull    a2, a2, a3      // a2 ← a2 × a3  (32×32→32 bits, sem overflow para uint8_t)
+    // ------------------------------------------------------------------
+    // Isola os 8 bits baixos do argumento 'entrada' (a2).
+    // Necessário porque o caller pode passar um uint8_t em um registrador
+    // de 32 bits com bits superiores nao-zerados dependendo do contexto.
+    // EXTUI: extrai bits [offset+len-1 : offset] de AS e zero-estende para 32b
+    // ------------------------------------------------------------------
+    extui   a2, a2, 0, 8        // a2 = a2[7:0]
 
-    // Resultado em a2: pronto para ser retornado ao caller C/C++
-    ret.n                   // Retorno estreito (2 bytes) — otimização de código
+    // ------------------------------------------------------------------
+    // Multiplicacao: duty = entrada * 4
+    // MULL AR, AS, AT: AR = (AS * AT) & 0xFFFFFFFF (32 bits baixos)
+    // a3 e scratch — nao afeta o caller (janela isolada pelo ENTRY)
+    // ------------------------------------------------------------------
+    movi    a3, 4               // a3 = 4
+    mull    a2, a2, a3          // a2 = a2 * 4  (retorno em a2)
 
-    .size calcularPWM, . - calcularPWM  // Metadado ELF: tamanho da função
+    // ------------------------------------------------------------------
+    // RETW.N: retorno com restauracao da janela (Windowed ABI).
+    // Restaura a janela do caller; o valor de retorno fica em a2.
+    // .N = narrow encoding (2 bytes em vez de 3, economiza flash).
+    // ------------------------------------------------------------------
+    retw.n
+
+    .size calcularPWM, .-calcularPWM
