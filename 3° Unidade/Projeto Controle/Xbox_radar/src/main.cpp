@@ -1,55 +1,48 @@
-// =============================================================================
-// main.cpp — Ponto de entrada do firmware do Rover FPV
-// Projeto: Rover FPV | Disciplina: IHS — Prof. Bruno Prado / UFS
-//
-// Arquitetura Dual-Core (FreeRTOS sobre Arduino/ESP-IDF):
-//
-//   CORE 0 (APP_CPU)
-//   ├── TaskXbox    → BLE connect/subscribe (driver_xbox)
-//   ├── TaskCamera  → OV2640 + servidor HTTP/MJPEG (camera_server)
-//   └── [interno]  → Pilha Wi-Fi (ESP-IDF)
-//
-//   CORE 1 (PRO_CPU)
-//   ├── TaskMotores → Consome filaComandos → ponte H (driver_motores)
-//   └── loop()      → Escuta TCP → produz filaComandos (driver_tcp)
-// =============================================================================
-
 #include <Arduino.h>
-#include "driver_motores.h"
-#include "driver_tcp.h"
-#include "driver_xbox.h"
-#include "camera_server.h"
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
 
-QueueHandle_t filaComandos = nullptr;
+int scanTime = 10; // Vai procurar durante 10 segundos
+BLEScan* pBLEScan;
 
-static const char* WIFI_SSID     = "Yorkshire012@5ghz";
-static const char* WIFI_PASSWORD = "Rafael@12";
+// O que acontece quando a ESP32 "ouve" algo no ar:
+class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
+    void onResult(BLEAdvertisedDevice advertisedDevice) {
+        if (advertisedDevice.haveName()) {
+            Serial.print("Dispositivo Encontrado: ");
+            Serial.print(advertisedDevice.getName().c_str());
+            Serial.print(" | MAC: ");
+            Serial.println(advertisedDevice.getAddress().toString().c_str());
+        }
+    }
+};
 
 void setup() {
-    Serial.begin(115200);
-    delay(500);
-    Serial.println("\n[MAIN] Rover FPV iniciando...");
+  Serial.begin(115200);
+  
+  // Aqui é o momento crítico onde a energia costumava cair:
+  Serial.println("A ligar a Antena Bluetooth (Teste de Energia)...");
+  BLEDevice::init("");
+  
+  // Se passar da linha acima sem reiniciar, o cabo funcionou!
+  Serial.println("Antena ligada com sucesso! O cabo aguentou o pico de energia.");
 
-    filaComandos = xQueueCreate(10, sizeof(Direcao));
-    if (filaComandos == nullptr) {
-        Serial.println("[MAIN] ERRO FATAL: falha ao criar filaComandos!");
-        while (true) { delay(1000); }
-    }
-    Serial.println("[MAIN] Fila criada (cap: 10 comandos).");
-
-    inicializarMotores();
-    inicializarBLE();
-    inicializarWiFi(WIFI_SSID, WIFI_PASSWORD);
-    iniciarServidorTCP();
-
-    xTaskCreatePinnedToCore(TaskMotores, "Motores", 2048, NULL, 2, NULL, 1);
-    xTaskCreatePinnedToCore(TaskXbox,   "XboxBLE", 8192, NULL, 1, NULL, 0);
-    xTaskCreatePinnedToCore(TaskCamera, "Camera",  4096, NULL, 1, NULL, 0);
-
-    Serial.println("[MAIN] Todas as tasks criadas. Sistema operacional.");
+  pBLEScan = BLEDevice::getScan(); 
+  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  pBLEScan->setActiveScan(true); 
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(99); 
 }
 
 void loop() {
-    verificarConexoesTCP();
-    delay(10);
+  Serial.println("\n--- A procurar dispositivos Bluetooth (10s) ---");
+  BLEScanResults foundDevices = pBLEScan->start(scanTime, false);
+  
+  Serial.print("Varredura concluída. Total de dispositivos: ");
+  Serial.println(foundDevices.getCount());
+  
+  pBLEScan->clearResults();   
+  delay(2000);
 }

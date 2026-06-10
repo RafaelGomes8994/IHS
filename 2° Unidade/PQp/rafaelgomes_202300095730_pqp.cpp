@@ -1,501 +1,445 @@
-#include <iostream>
-#include <fstream>
-#include <string>
-#include <vector>
-#include <cstdint>
-#include <cstdlib>
-#include <cstring>
-#include <cassert>
+#define _GNU_SOURCE
+
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <signal.h>
 #include <ucontext.h>
 
-// Macros para organização de opcodes
-#define IF_REGISTERS(codeBothOld, codeReg0Old, codeReg1Old, codeBothNew) \
-    do { \
-        if (reg0Index < 8 && reg1Index < 8) { codeBothOld } \
-        else if (reg0Index < 8) { codeReg0Old } \
-        else if (reg1Index < 8) { codeReg1Old } \
-        else { codeBothNew } \
-    } while (0)
+/* Flag para forçar a alocação de forma relativa segura (deslocamento 32-bit) */
+#ifndef MAP_32BIT
+#define MAP_32BIT 0x40
+#endif
 
-#define IF_REGISTERS_MEM(codeBothOld, codeReg1Old, codeReg0Old, codeBothNew) \
-    do { \
-        if (reg0Index < 8 && reg1Index < 8) { codeBothOld } \
-        else if (reg1Index < 8) { codeReg1Old } \
-        else if (reg0Index < 8) { codeReg0Old } \
-        else { codeBothNew } \
-    } while (0)
+/* ═══════════════════════════════════════════════════════════════
+   GEOMETRIA OTIMIZADA DO JIT E DA MÁQUINA VIRTUAL
+   ═══════════════════════════════════════════════════════════════ */
+#define BOOTSTRAP_SIZE 128
+#define SLOT_BYTES     32
+#define PQP_MEM_SIZE   256  /* Limite restrito de Von Neumann para forçar EXIT */
+#define MAX_INST       0x10000
 
+/* Mapeamento de registradores da arquitetura PQP para a arquitetura x86_64 */
+static const uint8_t PQP_TO_X86[16] = {
+    0,  1,  2,  3,  4,  5,  6,  7, 
+    8,  9,  10, 11, 12, 13, 14, 15 
+};
 
-// Encapsulamento do estado global do JIT Compiler
-namespace PQP_JIT {
-    constexpr size_t SIZE_INITIAL_CODE = 87;
+/* Mapeamento dos registradores de contexto para a saída nativa */
+static const uint8_t PQP_TO_UCONTEXT[16] = {
+    REG_RAX, REG_RCX, REG_RDX, REG_RBX,
+    REG_RSP, REG_RBP, REG_RSI, REG_RDI,
+    REG_R8,  REG_R9,  REG_R10, REG_R11,
+    REG_R12, REG_R13, REG_R14, REG_R15
+};
 
-    std::FILE* outputF = nullptr;
+/* Globais para leitura e escrita */
+FILE *g_input;
+FILE *g_output;
 
-    const uint8_t REGS[16] = {
-        REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI,
-        REG_R8, REG_R9, REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15
-    };
+uint8_t  *PICO_MEMO = NULL;
+uint32_t *vector_lanes = NULL; /* Constantes de incremento do Profiler (XMM) */
 
-    uint8_t* PICO_MEM = nullptr;
-    uint8_t ORIGINAL_PICO_MEM[256] = {0}; 
+typedef struct { uint8_t *code; uint64_t pos; size_t size; } JitBuf;
+static JitBuf jit;
 
-    struct Code_t {
-        uint8_t* code = nullptr;
-        uint64_t pos = 0;
-        size_t size = 0;
-    };
+static uint32_t  xlat_order[MAX_INST];
+static uint32_t  xlat_count;
+static char      xlat_str[MAX_INST][64];
+static char      g_line_buf[64];
 
-    Code_t codeMemory;
+/* ═══════════════════════════════════════════════════════════════
+   EMISSORES BÁSICOS
+   ═══════════════════════════════════════════════════════════════ */
+static inline void emit_seek(uint64_t off) { jit.pos = off; }
+static inline void emit8(uint8_t b)        { jit.code[jit.pos++] = b; }
+static inline void emit32(uint32_t v)      { *(uint32_t *)&jit.code[jit.pos] = v; jit.pos += 4; }
+static inline void emit_imm16sx(int16_t v) { *(uint32_t *)&jit.code[jit.pos] = (uint32_t)(int32_t)v; jit.pos += 4; }
+static inline void emit_rel32(int32_t rel) { *(int32_t *)&jit.code[jit.pos] = rel; jit.pos += 4; }
 
-    constexpr uint8_t initialCode[SIZE_INITIAL_CODE] = {
-        0x48, 0x31, 0xC0, 0x48, 0x31, 0xDB, 0x48, 0x31, 0xC9, 0x48, 0x31, 0xD2,
-        0x48, 0x31, 0xF6, 0x48, 0x31, 0xFF, 0x48, 0x31, 0xED, 0x48, 0x31, 0xE4,
-        0x4D, 0x31, 0xC0, 0x4D, 0x31, 0xC9, 0x4D, 0x31, 0xD2, 0x4D, 0x31, 0xDB,
-        0x4D, 0x31, 0xE4, 0x4D, 0x31, 0xED, 0x4D, 0x31, 0xF6, 0x4D, 0x31, 0xFF,
-        0x9B, 0xDB, 0xE2, 
-        0x66, 0x0F, 0xEF, 0xC0, 0x66, 0x0F, 0xEF, 0xC9, 0x66, 0x0F, 0xEF, 0xD2, 0x66, 0x0F, 0xEF, 0xDB,
-        0x66, 0x44, 0x0F, 0xEF, 0xC0, 0x66, 0x44, 0x0F, 0xEF, 0xC9, 0x66, 0x44, 0x0F, 0xEF, 0xD2, 0x66, 0x44, 0x0F, 0xEF, 0xDB
-    };
+static inline uint8_t x86_reg_enc(uint8_t pqp_idx) { return PQP_TO_X86[pqp_idx] & 7; }
+static inline int needs_rex(uint8_t pqp_idx)       { return PQP_TO_X86[pqp_idx] >= 8; }
 
-    uint32_t* const_1_0_0_0 = nullptr;
-    uint32_t* const_0_1_0_0 = nullptr;
-    uint32_t* const_0_0_1_0 = nullptr;
-    uint32_t* const_0_0_0_1 = nullptr;
+/* Injetor de Profiler Massivo via Registradores Vetoriais  */
+static inline void emit_fast_profiler(uint32_t PC) {
+    uint32_t inst_id = PC / 4;
+    uint32_t x_reg   = inst_id / 4;
+    uint32_t l_idx   = inst_id % 4;
 
-    // --- Emissores de Opcodes (C++ Inlines) ---
-    inline void setApdCAddress(uint64_t addr) {
-        codeMemory.pos = addr;
+    if (x_reg >= 8) {
+        emit8(0x66); emit8(0x44); emit8(0x0F); emit8(0xFE);
+        emit8(0x05 | ((x_reg - 8) << 3));
+    } else {
+        emit8(0x66); emit8(0x0F); emit8(0xFE);
+        emit8(0x05 | (x_reg << 3));
     }
 
-    inline void apdC(uint8_t byte) {
-        codeMemory.code[codeMemory.pos++] = byte;
-    }
-
-    inline void apdC_PTR32(uint32_t ptr) {
-        uint32_t* asU32Code = reinterpret_cast<uint32_t*>(&codeMemory.code[codeMemory.pos]);
-        *asU32Code = ptr;
-        codeMemory.pos += 4;
-    }
-
-    inline void insertPICO_MEM(uint8_t* ptr) {
-        uint32_t* asU32Code = reinterpret_cast<uint32_t*>(&codeMemory.code[codeMemory.pos]);
-        *asU32Code = static_cast<uint32_t>(reinterpret_cast<uint64_t>(ptr));
-        codeMemory.pos += 4;
-    }
-
-    inline void apdC_InsertImm16(int16_t imm16) {
-        uint32_t* asU32Code = reinterpret_cast<uint32_t*>(&codeMemory.code[codeMemory.pos]);
-        *asU32Code = static_cast<uint32_t>(static_cast<int32_t>(imm16)); // Sign Extend
-        codeMemory.pos += 4;
-    }
-
-    inline void apdC_InsertEnderecoJmp(int32_t imm32) {
-        uint32_t* asU32Code = reinterpret_cast<uint32_t*>(&codeMemory.code[codeMemory.pos]);
-        *asU32Code = static_cast<uint32_t>(imm32);
-        codeMemory.pos += 4;
-    }
-
-    inline void apdC_InsertCounter(uint32_t PC) {
-        uint8_t compact_idx = (PC == 0) ? 0 : (PC - 20) / 4 + 1;
-        uint8_t xmm_reg = compact_idx / 4;
-        uint8_t lane = compact_idx % 4;
-
-        apdC(0x66); apdC(0x0F); apdC(0xFE);
-        apdC(0x04 + (xmm_reg << 3)); apdC(0x25);
-
-        uint32_t* temp[4] = {const_1_0_0_0, const_0_1_0_0, const_0_0_1_0, const_0_0_0_1};
-        apdC_PTR32(static_cast<uint32_t>(reinterpret_cast<uint64_t>(temp[lane])));
-    }
+    uint8_t *next_rip = jit.code + jit.pos + 4;
+    uint8_t *target_mem = (uint8_t *)&vector_lanes[l_idx * 4];
+    emit32((uint32_t)(target_mem - next_rip));
 }
 
-// Os signal handlers do C++ para SO precisam de linkage C para evitar name mangling
-extern "C" {
-    void trapHandler(int32_t sig, siginfo_t *si, void* context) {
-        using namespace PQP_JIT;
+/* ═══════════════════════════════════════════════════════════════
+   GERAÇÃO DO BOOTSTRAP DINÂMICO
+   ═══════════════════════════════════════════════════════════════ */
+static void build_bootstrap() {
+    emit_seek(0); 
+    
+    /* 1. Zera GPRs nativos */
+    for (int i = 15; i >= 0; i--) {
+        uint8_t enc = x86_reg_enc(i);
+        if (needs_rex(i)) emit8(0x4D); else emit8(0x48);
+        emit8(0x29);
+        emit8(0xC0 | (enc << 3) | enc);
+    }
+    
+    /* 2. Reseta o Floating Point Unit nativo */
+    emit8(0xDB); emit8(0xE3);
+    
+    /* 3. Zera os 16 registradores XMM do processador iterativamente */
+    for (int i = 0; i < 16; i++) {
+        emit8(0x66);
+        if (i >= 8) emit8(0x45);
+        emit8(0x0F); emit8(0xEF);
+        emit8(0xC0 | ((i & 7) << 3) | (i & 7));
+    }
+
+    /* 4. Pula para o primeiro slot (offset absoluto) */
+    emit8(0xE9);
+    uint8_t *next_rip = jit.code + jit.pos + 4;
+    uint8_t *dest = jit.code + BOOTSTRAP_SIZE;
+    emit32((uint32_t)(dest - next_rip));
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   DISPATCH TABLE - Emissores Nativos para cada Instrução
+   ═══════════════════════════════════════════════════════════════ */
+typedef void (*emitter_func_t)(uint32_t PC, uint8_t rD, uint8_t rS, int16_t imm, uint32_t PC_next);
+static emitter_func_t dispatch[16];
+
+static void emit_alu_rr(uint8_t opcode, uint8_t dst_pqp, uint8_t src_pqp) {
+    uint8_t dst_enc = x86_reg_enc(dst_pqp);
+    uint8_t src_enc = x86_reg_enc(src_pqp);
+    int dst_hi = needs_rex(dst_pqp), src_hi = needs_rex(src_pqp);
+
+    if (dst_hi || src_hi) {
+        emit8(0x40 | (src_hi ? 0x04 : 0) | (dst_hi ? 0x01 : 0));
+    }
+    emit8(opcode);
+    emit8(0xC0 | (src_enc << 3) | dst_enc);
+}
+
+/* O guardrail condicional nativo contra saltos infinitos/fora da área */
+static void emit_branch(uint8_t opc1, uint8_t opc2, uint32_t target_PC, int two_byte) {
+    if (two_byte) { emit8(opc1); emit8(opc2); } 
+    else { emit8(opc1); }
+    
+    uint8_t *next_rip = jit.code + jit.pos + 4;
+    uint8_t *dest_rip;
+    
+    if (target_PC >= MAX_INST * 4) { 
+        /* Caiu na Trap nativa do JIT -> ejetar a Matrix via SIGSEGV */
+        dest_rip = jit.code + jit.size + 1024; 
+    } else {
+        /* Deslocamento Matemático atualizado para o Slot de 32 Bytes! 
+         * (SLOT_BYTES / 4) resolve o fator de multiplicação automaticamente 
+         */
+        dest_rip = jit.code + BOOTSTRAP_SIZE + (target_PC * (SLOT_BYTES / 4)); 
+    }
+    
+    int32_t disp32 = (int32_t)(dest_rip - next_rip);
+    emit_rel32(disp32);
+}
+
+static void op_00_mov_imm(uint32_t PC, uint8_t rD, uint8_t rS, int16_t imm, uint32_t PC_next) {
+    snprintf(xlat_str[PC], sizeof xlat_str[0], "mov_r%u,%08x\n", rD, (uint32_t)(int32_t)imm);
+    uint8_t enc = x86_reg_enc(rD);
+    if (needs_rex(rD)) emit8(0x41);
+    emit8(0xB8 + enc);
+    emit_imm16sx(imm);
+}
+
+static void op_01_mov_r(uint32_t PC, uint8_t rD, uint8_t rS, int16_t imm, uint32_t PC_next) {
+    snprintf(xlat_str[PC], sizeof xlat_str[0], "mov_r%u,r%u\n", rD, rS);
+    emit_alu_rr(0x89, rD, rS);
+}
+
+static void op_02_load(uint32_t PC, uint8_t rD, uint8_t rS, int16_t imm, uint32_t PC_next) {
+    snprintf(xlat_str[PC], sizeof xlat_str[0], "mov_r%u,[r%u]\n", rD, rS);
+    uint8_t d_enc = x86_reg_enc(rD), s_enc = x86_reg_enc(rS);
+    int d_hi = needs_rex(rD), s_hi = needs_rex(rS);
+    if (d_hi || s_hi) emit8(0x40 | (d_hi ? 0x04 : 0) | (s_hi ? 0x01 : 0));
+    
+    emit8(0x8B);
+    if (s_enc == 4) { emit8(0x80 | (d_enc << 3) | 4); emit8(0x24); } 
+    else { emit8(0x80 | (d_enc << 3) | s_enc); }
+    emit32((uint32_t)(uintptr_t)PICO_MEMO);
+}
+
+static void op_03_store(uint32_t PC, uint8_t rD, uint8_t rS, int16_t imm, uint32_t PC_next) {
+    snprintf(xlat_str[PC], sizeof xlat_str[0], "mov_[r%u],r%u\n", rD, rS);
+    uint8_t s_enc = x86_reg_enc(rS), d_enc = x86_reg_enc(rD);
+    int s_hi = needs_rex(rS), d_hi = needs_rex(rD);
+    if (s_hi || d_hi) emit8(0x40 | (s_hi ? 0x04 : 0) | (d_hi ? 0x01 : 0));
+    
+    emit8(0x89);
+    if (d_enc == 4) { emit8(0x80 | (s_enc << 3) | 4); emit8(0x24); } 
+    else { emit8(0x80 | (s_enc << 3) | d_enc); }
+    emit32((uint32_t)(uintptr_t)PICO_MEMO);
+}
+
+static void op_04_cmp(uint32_t PC, uint8_t rD, uint8_t rS, int16_t imm, uint32_t PC_next) {
+    snprintf(xlat_str[PC], sizeof xlat_str[0], "cmp_r%u<=>r%u\n", rD, rS);
+    emit_alu_rr(0x39, rD, rS);
+}
+
+static void op_05_jmp(uint32_t PC, uint8_t rD, uint8_t rS, int16_t imm, uint32_t PC_next) {
+    uint32_t PC_target = (PC_next + (int32_t)imm) & 0xFFFF;
+    snprintf(xlat_str[PC], sizeof xlat_str[0], "jmp_%04x\n", PC_target);
+    emit_branch(0xE9, 0, PC_target, 0);
+}
+
+static void op_06_jg(uint32_t PC, uint8_t rD, uint8_t rS, int16_t imm, uint32_t PC_next) {
+    uint32_t PC_target = (PC_next + (int32_t)imm) & 0xFFFF;
+    snprintf(xlat_str[PC], sizeof xlat_str[0], "jg_%04x\n", PC_target);
+    emit_branch(0x0F, 0x8F, PC_target, 1);
+}
+
+static void op_07_jl(uint32_t PC, uint8_t rD, uint8_t rS, int16_t imm, uint32_t PC_next) {
+    uint32_t PC_target = (PC_next + (int32_t)imm) & 0xFFFF;
+    snprintf(xlat_str[PC], sizeof xlat_str[0], "jl_%04x\n", PC_target);
+    emit_branch(0x0F, 0x8C, PC_target, 1);
+}
+
+static void op_08_je(uint32_t PC, uint8_t rD, uint8_t rS, int16_t imm, uint32_t PC_next) {
+    uint32_t PC_target = (PC_next + (int32_t)imm) & 0xFFFF;
+    snprintf(xlat_str[PC], sizeof xlat_str[0], "je_%04x\n", PC_target);
+    emit_branch(0x0F, 0x84, PC_target, 1);
+}
+
+static void op_09_add(uint32_t PC, uint8_t rD, uint8_t rS, int16_t imm, uint32_t PC_next) {
+    snprintf(xlat_str[PC], sizeof xlat_str[0], "add_r%u+=r%u\n", rD, rS);
+    emit_alu_rr(0x01, rD, rS);
+}
+
+static void op_0a_sub(uint32_t PC, uint8_t rD, uint8_t rS, int16_t imm, uint32_t PC_next) {
+    snprintf(xlat_str[PC], sizeof xlat_str[0], "sub_r%u-=r%u\n", rD, rS);
+    emit_alu_rr(0x29, rD, rS);
+}
+
+static void op_0b_and(uint32_t PC, uint8_t rD, uint8_t rS, int16_t imm, uint32_t PC_next) {
+    snprintf(xlat_str[PC], sizeof xlat_str[0], "and_r%u&=r%u\n", rD, rS);
+    emit_alu_rr(0x21, rD, rS);
+}
+
+static void op_0c_or(uint32_t PC, uint8_t rD, uint8_t rS, int16_t imm, uint32_t PC_next) {
+    snprintf(xlat_str[PC], sizeof xlat_str[0], "or_r%u|=r%u\n", rD, rS);
+    emit_alu_rr(0x09, rD, rS);
+}
+
+static void op_0d_xor(uint32_t PC, uint8_t rD, uint8_t rS, int16_t imm, uint32_t PC_next) {
+    snprintf(xlat_str[PC], sizeof xlat_str[0], "xor_r%u^=r%u\n", rD, rS);
+    emit_alu_rr(0x31, rD, rS);
+}
+
+static void op_0e_sal(uint32_t PC, uint8_t rD, uint8_t rS, int16_t imm, uint32_t PC_next) {
+    uint8_t shift = PICO_MEMO[PC + 3] & 0x0F;
+    snprintf(xlat_str[PC], sizeof xlat_str[0], "sal_r%u<<=%u\n", rD, shift);
+    uint8_t d_enc = x86_reg_enc(rD);
+    if (needs_rex(rD)) emit8(0x41);
+    emit8(0xC1); emit8((4 << 3) | 0xC0 | d_enc); emit8(shift);
+}
+
+static void op_0f_sar(uint32_t PC, uint8_t rD, uint8_t rS, int16_t imm, uint32_t PC_next) {
+    uint8_t shift = PICO_MEMO[PC + 3] & 0x0F;
+    snprintf(xlat_str[PC], sizeof xlat_str[0], "sar_r%u>>=%u\n", rD, shift);
+    uint8_t d_enc = x86_reg_enc(rD);
+    if (needs_rex(rD)) emit8(0x41);
+    emit8(0xC1); emit8((7 << 3) | 0xC0 | d_enc); emit8(shift);
+}
+
+static void init_dispatch_table() {
+    dispatch[0x00] = op_00_mov_imm; dispatch[0x01] = op_01_mov_r;
+    dispatch[0x02] = op_02_load;    dispatch[0x03] = op_03_store;
+    dispatch[0x04] = op_04_cmp;     dispatch[0x05] = op_05_jmp;
+    dispatch[0x06] = op_06_jg;      dispatch[0x07] = op_07_jl;
+    dispatch[0x08] = op_08_je;      dispatch[0x09] = op_09_add;
+    dispatch[0x0A] = op_0a_sub;     dispatch[0x0B] = op_0b_and;
+    dispatch[0x0C] = op_0c_or;      dispatch[0x0D] = op_0d_xor;
+    dispatch[0x0E] = op_0e_sal;     dispatch[0x0F] = op_0f_sar;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   ROTINAS DE ENCERRAMENTO E HANDLERS JIT
+   ═══════════════════════════════════════════════════════════════ */
+static void do_exit(ucontext_t *ctx, uint32_t PC_exit) {
+    /* Leitura Ultra-Rápida direto do Contexto da CPU (fpregs = offset 160) */
+    uint8_t *float_env = (uint8_t *)ctx->uc_mcontext.fpregs;
+    uint32_t *vec_state = (uint32_t *)(float_env + 160);
+
+    uint32_t max_count = 0;
+    for (uint32_t i = 0; i < xlat_count; i++) {
+        uint32_t c = vec_state[xlat_order[i] / 4];
+        if (c > max_count) max_count = c;
+    }
+
+    int max_digits = snprintf(NULL, 0, "%u", max_count);
+    char fmt_inst[64], fmt_exit[64];
+    sprintf(fmt_inst, "%%%du:%%04x:%%s", max_digits+5);
+    sprintf(fmt_exit, "%%%ds:%%04x:exit\n", max_digits+5);
+
+    for (uint32_t i = 0; i < xlat_count; i++) {
+        for (uint32_t j = i + 1; j < xlat_count; j++) {
+            if (xlat_order[i] > xlat_order[j]) {
+                uint32_t t = xlat_order[i]; xlat_order[i] = xlat_order[j]; xlat_order[j] = t;
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < xlat_count; i++) {
+        uint32_t pc  = xlat_order[i];
+        uint32_t cnt = vec_state[pc / 4];
+        fprintf(g_output, fmt_inst, cnt, pc, xlat_str[pc]);
+    }
+
+    fprintf(g_output, fmt_exit, "-", PC_exit);
+    fprintf(g_output, "\n");
+    for (int i = 0; i < 15; i++)
+        fprintf(g_output, "r%d=%08x,", i, (uint32_t)ctx->uc_mcontext.gregs[PQP_TO_UCONTEXT[i]]);
+    fprintf(g_output, "r15=%08x\n", (uint32_t)ctx->uc_mcontext.gregs[PQP_TO_UCONTEXT[15]]);
+
+    exit(0);
+}
+
+static void jit_compile(int sig, siginfo_t *si, void *ctx_ptr) {
+    ucontext_t *ctx = (ucontext_t *)ctx_ptr;
+
+    uint64_t rip      = (uint64_t)ctx->uc_mcontext.gregs[REG_RIP];
+    
+    /* A instrução INT3 incrementou o RIP em 1, por isso subtraímos 1 */
+    uint64_t slot_off = rip - 1 - (uint64_t)jit.code - BOOTSTRAP_SIZE;
+    uint32_t slot_idx = (uint32_t)(slot_off / SLOT_BYTES);
+    uint32_t PC       = slot_idx * 4;
+
+    /* Se um Jump cair aqui, invocamos o Exit com estado intacto! */
+    if (PC >= PQP_MEM_SIZE) { 
+        do_exit(ctx, PC);
+        return; 
+    }
+
+    xlat_order[xlat_count++] = PC;
+    emit_seek(BOOTSTRAP_SIZE + (slot_idx * SLOT_BYTES));
+    uint64_t start_pos = jit.pos;
+
+    emit_fast_profiler(PC);
+
+    uint8_t  opcode  = PICO_MEMO[PC];
+    uint8_t  byte1   = PICO_MEMO[PC + 1];
+    /* Captura nativa como signed int16_t (trata saltos negativos sozinhos) */
+    int16_t  imm16   = *(int16_t *)&PICO_MEMO[PC + 2];
+
+    dispatch[opcode](PC, byte1 >> 4, byte1 & 0x0F, imm16, PC + 4);
+
+/* Calcula quantos bytes faltam para completar os 32 bytes do slot.
+     */
+    uint32_t current_len = jit.pos -    start_pos;
+    if (current_len < SLOT_BYTES) {
+        uint32_t remaining = SLOT_BYTES - current_len;
         
-        ucontext_t* ctx = reinterpret_cast<ucontext_t*>(context);
-        uint64_t currentRip = static_cast<uint64_t>(ctx->uc_mcontext.gregs[REG_RIP]);
-        uint32_t instructionIndex = ((currentRip) - reinterpret_cast<uint64_t>(codeMemory.code) - SIZE_INITIAL_CODE) >> 4; 
-        uint32_t pc = instructionIndex << 2;
-        uint8_t opcodeByte = PICO_MEM[pc];
+        if (remaining >= 2) {
+            /* Injeta um JMP curto (0xEB) que pula o lixo todo numa fração de ciclo */
+            emit8(0xEB); 
+            emit8(remaining - 2); /* offset do pulo */
 
-        setApdCAddress((currentRip) - 1 - reinterpret_cast<uint64_t>(codeMemory.code));
-        apdC_InsertCounter(pc); 
-
-        switch (opcodeByte) {
-            case 0x00:
-                {
-                    uint8_t reg0Index = PICO_MEM[pc+1] >> 4;
-                    int16_t immValue = *reinterpret_cast<int16_t*>(&PICO_MEM[pc+2]);
-
-                    if (reg0Index <= 7){
-                        apdC(0xb8 + reg0Index); apdC_InsertImm16(immValue);
-                        apdC(0x90); apdC(0x90);
-                    } else {
-                        apdC(0x41); apdC(0xb8 + reg0Index - 8); apdC_InsertImm16(immValue);
-                        apdC(0x90);
-                    }
-                    ctx->uc_mcontext.gregs[REG_RIP] = reinterpret_cast<uint64_t>(&codeMemory.code[codeMemory.pos - 16]);
-                }
-                break;
-            case 0x01:
-                {
-                    uint8_t reg0Index = PICO_MEM[pc+1] >> 4;
-                    uint8_t reg1Index = PICO_MEM[pc+1] & 0xF;
-                    IF_REGISTERS(
-                        apdC(0x89); apdC(0xC0 + reg0Index + (reg1Index << 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); ,
-                        apdC(0x44); apdC(0x89); apdC(0xC0 + reg0Index + ((reg1Index - 8) << 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); ,
-                        apdC(0x41); apdC(0x89); apdC(0xC0 + reg0Index - 8 + (reg1Index << 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); ,
-                        apdC(0x45); apdC(0x89); apdC(0xC0 + reg0Index - 8 + ((reg1Index - 8) << 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90);
-                    );
-                    ctx->uc_mcontext.gregs[REG_RIP] = reinterpret_cast<uint64_t>(&codeMemory.code[codeMemory.pos - 16]);
-                }
-                break;
-            case 0x02:
-                {
-                    uint8_t reg0Index = PICO_MEM[pc+1] >> 4;
-                    uint8_t reg1Index = PICO_MEM[pc+1] & 0xF;
-                    IF_REGISTERS_MEM(
-                        apdC(0x8B); apdC(0x80 + reg1Index + (reg0Index << 3)); insertPICO_MEM(PICO_MEM); apdC(0x90); ,
-                        apdC(0x44); apdC(0x8B); apdC(0x80 + reg1Index + ((reg0Index - 8) << 3)); insertPICO_MEM(PICO_MEM); ,
-                        apdC(0x41); apdC(0x8B); apdC(0x80 + reg1Index - 8 + (reg0Index << 3)); insertPICO_MEM(PICO_MEM); ,
-                        apdC(0x45); apdC(0x8B); apdC(0x80 + reg1Index - 8 + ((reg0Index - 8) << 3)); insertPICO_MEM(PICO_MEM);
-                    );
-                    ctx->uc_mcontext.gregs[REG_RIP] = reinterpret_cast<uint64_t>(&codeMemory.code[codeMemory.pos - 16]);
-                }
-                break;
-            case 0x03:
-                {
-                    uint8_t reg0Index = PICO_MEM[pc+1] >> 4;
-                    uint8_t reg1Index = PICO_MEM[pc+1] & 0xF;
-                    IF_REGISTERS(
-                        apdC(0x89); apdC(0x80 + reg0Index + (reg1Index << 3)); insertPICO_MEM(PICO_MEM); apdC(0x90); ,
-                        apdC(0x44); apdC(0x89); apdC(0x80 + reg0Index + ((reg1Index - 8) << 3)); insertPICO_MEM(PICO_MEM); ,
-                        apdC(0x41); apdC(0x89); apdC(0x80 + reg0Index - 8 + (reg1Index << 3)); insertPICO_MEM(PICO_MEM); ,
-                        apdC(0x45); apdC(0x89); apdC(0x80 + reg0Index - 8 + ((reg1Index - 8) << 3)); insertPICO_MEM(PICO_MEM);
-                    );
-                    ctx->uc_mcontext.gregs[REG_RIP] = reinterpret_cast<uint64_t>(&codeMemory.code[codeMemory.pos - 16]);
-                }
-                break;
-            case 0x04:
-                {
-                    uint8_t reg0Index = PICO_MEM[pc+1] >> 4;
-                    uint8_t reg1Index = PICO_MEM[pc+1] & 0xF;
-                    IF_REGISTERS(
-                        apdC(0x39); apdC(0xC0 + reg0Index + (reg1Index << 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); ,
-                        apdC(0x44); apdC(0x39); apdC(0xC0 + reg0Index + ((reg1Index - 8) << 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); ,
-                        apdC(0x41); apdC(0x39); apdC(0xC0 + reg0Index - 8 + (reg1Index<< 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); ,
-                        apdC(0x45); apdC(0x39); apdC(0xC0 + reg0Index - 8 + ((reg1Index - 8) << 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90);
-                    );
-                    ctx->uc_mcontext.gregs[REG_RIP] = reinterpret_cast<uint64_t>(&codeMemory.code[codeMemory.pos - 16]);
-                }
-                break;
-            case 0x05:
-                {
-                    int16_t immValue = *reinterpret_cast<int16_t*>(&PICO_MEM[pc+2]);
-                    uint32_t targetPc = (pc + immValue + 4);
-                    apdC(0xE9);
-                    uint8_t * nextRip   = codeMemory.code + (codeMemory.pos + 4);
-                    uint8_t * destRip   = codeMemory.code + SIZE_INITIAL_CODE + ((targetPc / 4) * 16);
-                    int32_t   rel32     = static_cast<int32_t>(destRip - nextRip);
-                    apdC_InsertEnderecoJmp(rel32);
-                    apdC(0x90); apdC(0x90);
-                    ctx->uc_mcontext.gregs[REG_RIP] = reinterpret_cast<uint64_t>(&codeMemory.code[codeMemory.pos - 16]);
-                }
-                break;
-            case 0x06:
-                {
-                    int16_t immValue = *reinterpret_cast<int16_t*>(&PICO_MEM[pc+2]);
-                    uint32_t targetPc = (pc + immValue + 4);
-                    apdC(0x0F); apdC(0x8F);
-                    uint8_t * nextRip   = codeMemory.code + (codeMemory.pos + 4);
-                    uint8_t * destRip   = codeMemory.code + SIZE_INITIAL_CODE + ((targetPc / 4) * 16);
-                    int32_t   rel32     = static_cast<int32_t>(destRip - nextRip);
-                    apdC_InsertEnderecoJmp(rel32);
-                    apdC(0x90);
-                    ctx->uc_mcontext.gregs[REG_RIP] = reinterpret_cast<uint64_t>(&codeMemory.code[codeMemory.pos - 16]);
-                }
-                break;
-            case 0x07:
-                {
-                    int16_t immValue = *reinterpret_cast<int16_t*>(&PICO_MEM[pc+2]);
-                    uint32_t targetPc = (pc + immValue + 4);
-                    apdC(0x0F); apdC(0x8C);
-                    uint8_t * nextRip   = codeMemory.code + (codeMemory.pos + 4);
-                    uint8_t * destRip   = codeMemory.code + SIZE_INITIAL_CODE + ((targetPc / 4) * 16);
-                    int32_t   rel32     = static_cast<int32_t>(destRip - nextRip);
-                    apdC_InsertEnderecoJmp(rel32);
-                    apdC(0x90);
-                    ctx->uc_mcontext.gregs[REG_RIP] = reinterpret_cast<uint64_t>(&codeMemory.code[codeMemory.pos - 16]);
-                }
-                break;
-            case 0x08:
-                {
-                    int16_t immValue = *reinterpret_cast<int16_t*>(&PICO_MEM[pc+2]);
-                    uint32_t targetPc = (pc + immValue + 4);
-                    apdC(0x0F); apdC(0x84);
-                    uint8_t * nextRip   = codeMemory.code + (codeMemory.pos + 4);
-                    uint8_t * destRip   = codeMemory.code + SIZE_INITIAL_CODE + ((targetPc / 4) * 16);
-                    int32_t   rel32     = static_cast<int32_t>(destRip - nextRip);
-                    apdC_InsertEnderecoJmp(rel32);
-                    apdC(0x90);
-                    ctx->uc_mcontext.gregs[REG_RIP] = reinterpret_cast<uint64_t>(&codeMemory.code[codeMemory.pos - 16]);
-                }
-                break;
-            case 0x09:
-                {
-                    uint8_t reg0Index = PICO_MEM[pc+1] >> 4;
-                    uint8_t reg1Index = PICO_MEM[pc+1] & 0xF;
-                    IF_REGISTERS(
-                        apdC(0x01); apdC(0xC0 + reg0Index + (reg1Index << 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); ,
-                        apdC(0x44); apdC(0x01); apdC(0xC0 + reg0Index + ((reg1Index - 8) << 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); ,
-                        apdC(0x41); apdC(0x01); apdC(0xC0 + reg0Index - 8 + (reg1Index<< 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); ,
-                        apdC(0x45); apdC(0x01); apdC(0xC0 + reg0Index - 8 + ((reg1Index - 8) << 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90);
-                    );
-                    ctx->uc_mcontext.gregs[REG_RIP] = reinterpret_cast<uint64_t>(&codeMemory.code[codeMemory.pos - 16]);
-                }
-                break; 
-            case 0X0A:
-                {
-                    uint8_t reg0Index = PICO_MEM[pc+1] >> 4;
-                    uint8_t reg1Index = PICO_MEM[pc+1] & 0xF;
-                    IF_REGISTERS(
-                        apdC(0x29); apdC(0xC0 + reg0Index + (reg1Index << 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); ,
-                        apdC(0x44); apdC(0x29); apdC(0xC0 + reg0Index + ((reg1Index - 8) << 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); ,
-                        apdC(0x41); apdC(0x29); apdC(0xC0 + reg0Index - 8 + (reg1Index<< 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); ,
-                        apdC(0x45); apdC(0x29); apdC(0xC0 + reg0Index - 8 + ((reg1Index - 8) << 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90);
-                    );
-                    ctx->uc_mcontext.gregs[REG_RIP] = reinterpret_cast<uint64_t>(&codeMemory.code[codeMemory.pos - 16]);
-                }
-                break;
-            case 0x0B:
-                {
-                    uint8_t reg0Index = PICO_MEM[pc+1] >> 4;
-                    uint8_t reg1Index = PICO_MEM[pc+1] & 0xF;
-                    IF_REGISTERS(
-                        apdC(0x21); apdC(0xC0 + reg0Index + (reg1Index << 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); ,
-                        apdC(0x44); apdC(0x21); apdC(0xC0 + reg0Index + ((reg1Index - 8) << 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); ,
-                        apdC(0x41); apdC(0x21); apdC(0xC0 + reg0Index - 8 + (reg1Index<< 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); ,
-                        apdC(0x45); apdC(0x21); apdC(0xC0 + reg0Index - 8 + ((reg1Index - 8) << 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90);
-                    );
-                    ctx->uc_mcontext.gregs[REG_RIP] = reinterpret_cast<uint64_t>(&codeMemory.code[codeMemory.pos - 16]);
-                }
-                break;
-            case 0x0C:
-                {
-                    uint8_t reg0Index = PICO_MEM[pc+1] >> 4;
-                    uint8_t reg1Index = PICO_MEM[pc+1] & 0xF;
-                    IF_REGISTERS(
-                        apdC(0x09); apdC(0xC0 + reg0Index + (reg1Index << 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); ,
-                        apdC(0x44); apdC(0x09); apdC(0xC0 + reg0Index + ((reg1Index - 8) << 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); ,
-                        apdC(0x41); apdC(0x09); apdC(0xC0 + reg0Index - 8 + (reg1Index<< 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); ,
-                        apdC(0x45); apdC(0x09); apdC(0xC0 + reg0Index - 8 + ((reg1Index - 8) << 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90);
-                    );
-                    ctx->uc_mcontext.gregs[REG_RIP] = reinterpret_cast<uint64_t>(&codeMemory.code[codeMemory.pos - 16]);
-                }
-                break;
-            case 0x0D:
-                {
-                    uint8_t reg0Index = PICO_MEM[pc+1] >> 4;
-                    uint8_t reg1Index = PICO_MEM[pc+1] & 0xF;
-                    IF_REGISTERS(
-                        apdC(0x31); apdC(0xC0 + reg0Index + (reg1Index << 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); ,
-                        apdC(0x44); apdC(0x31); apdC(0xC0 + reg0Index + ((reg1Index - 8) << 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); ,
-                        apdC(0x41); apdC(0x31); apdC(0xC0 + reg0Index - 8 + (reg1Index<< 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90); ,
-                        apdC(0x45); apdC(0x31); apdC(0xC0 + reg0Index - 8 + ((reg1Index - 8) << 3)); apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90);
-                    );
-                    ctx->uc_mcontext.gregs[REG_RIP] = reinterpret_cast<uint64_t>(&codeMemory.code[codeMemory.pos - 16]);
-                }
-                break;
-            case 0x0E:
-                {
-                    uint8_t reg0Index = PICO_MEM[pc+1] >> 4;
-                    uint8_t slImm = PICO_MEM[pc+3] & 0xF;
-                    if (reg0Index < 8){
-                        apdC(0xC1); apdC(0xE0 + reg0Index); apdC(slImm);
-                        apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90);
-                    } else {
-                        apdC(0x41); apdC(0xC1); apdC(0xE0 + reg0Index - 8); apdC(slImm);
-                        apdC(0x90); apdC(0x90); apdC(0x90);
-                    }
-                    ctx->uc_mcontext.gregs[REG_RIP] = reinterpret_cast<uint64_t>(&codeMemory.code[codeMemory.pos - 16]);
-                }
-                break;
-            case 0x0F:
-                {
-                    uint8_t reg0Index = PICO_MEM[pc+1] >> 4;
-                    uint8_t slImm = PICO_MEM[pc+3] & 0xF;
-                    if (reg0Index < 8){
-                        apdC(0xC1); apdC(0xF8 + reg0Index); apdC(slImm);
-                        apdC(0x90); apdC(0x90); apdC(0x90); apdC(0x90);
-                    } else {
-                        apdC(0x41); apdC(0xC1); apdC(0xF8 + reg0Index - 8); apdC(slImm);
-                        apdC(0x90); apdC(0x90); apdC(0x90);
-                    }
-                    ctx->uc_mcontext.gregs[REG_RIP] = reinterpret_cast<uint64_t>(&codeMemory.code[codeMemory.pos - 16]);
-                }
-                break;
+            while ((jit.pos - start_pos) < SLOT_BYTES) {
+                emit8(0x90);
+            }
+        } else {
+            /* Se por acaso faltar apenas 1 byte, botamos só um NOP */
+            while ((jit.pos - start_pos) < SLOT_BYTES) emit8(0x90);
         }
     }
 
-    void segvHandler(int32_t sig, siginfo_t *si, void* context) {
-        using namespace PQP_JIT;
-        
-        ucontext_t* ctx = reinterpret_cast<ucontext_t*>(context);
-        struct _libc_fpstate* fpState = ctx->uc_mcontext.fpregs;
+    ctx->uc_mcontext.gregs[REG_RIP] = (greg_t)(jit.code + start_pos);
+}
 
-        for (int i = 0; i <= 140; i += 4) {
-            if (i > 0 && i < 20) continue; 
-            
-            uint8_t compact_idx = (i == 0) ? 0 : (i - 20) / 4 + 1;
-            uint8_t xmm_reg = compact_idx / 4;
-            uint8_t lane = compact_idx % 4;
-            
-            uint32_t count = 0;
-            if (fpState) {
-                count = (reinterpret_cast<const uint32_t*>(&fpState->_xmm[xmm_reg]))[lane];
-            }
+/* Guardrail para falhas nativas do SO caso ocorram */
+static void jit_exit(int sig, siginfo_t *si, void *ctx_ptr) {
+    ucontext_t *ctx = (ucontext_t *)ctx_ptr;
+    uint64_t rip = (uint64_t)ctx->uc_mcontext.gregs[REG_RIP];
 
-            if (count > 0) {
-                uint8_t opcode = ORIGINAL_PICO_MEM[i];
-                uint8_t rx = ORIGINAL_PICO_MEM[i+1] >> 4;
-                uint8_t ry = ORIGINAL_PICO_MEM[i+1] & 0xF;
-                int16_t imm = *reinterpret_cast<int16_t*>(&ORIGINAL_PICO_MEM[i+2]);
-                uint32_t target = (i + 4 + imm) & 0xFFFF;
+    if (rip < (uint64_t)jit.code + BOOTSTRAP_SIZE) return;
 
-                std::fprintf(outputF, "%u:%04x:", count, i);
+    uint32_t PC_exit = (uint32_t)((rip - (uint64_t)jit.code - BOOTSTRAP_SIZE) / SLOT_BYTES) * 4;
+    do_exit(ctx, PC_exit);
+}
 
-                switch (opcode) {
-                    case 0x00: std::fprintf(outputF, "mov_r%u=%08x\n", rx, static_cast<int32_t>(imm)); break;
-                    case 0x01: std::fprintf(outputF, "mov_r%u=r%u\n", rx, ry); break;
-                    case 0x02: std::fprintf(outputF, "mov_r%u=[r%u]\n", rx, ry); break;
-                    case 0x03: std::fprintf(outputF, "mov_[r%u]=r%u\n", rx, ry); break;
-                    case 0x04: std::fprintf(outputF, "cmp_r%u<=>r%u\n", rx, ry); break;
-                    case 0x05: 
-                        if (target == 0xDEAD) std::fprintf(outputF, "jmp_dead\n");
-                        else std::fprintf(outputF, "jmp_%04x\n", target);
-                        break;
-                    case 0x06: std::fprintf(outputF, "jg_%04x\n", target); break;
-                    case 0x07: std::fprintf(outputF, "jl_%04x\n", target); break;
-                    case 0x08: std::fprintf(outputF, "je_%04x\n", target); break;
-                    case 0x09: std::fprintf(outputF, "add_r%u+=r%u\n", rx, ry); break;
-                    case 0x0A: std::fprintf(outputF, "sub_r%u-=r%u\n", rx, ry); break;
-                    case 0x0B: std::fprintf(outputF, "and_r%u&=r%u\n", rx, ry); break;
-                    case 0x0C: std::fprintf(outputF, "or_r%u|=r%u\n", rx, ry); break;
-                    case 0x0D: std::fprintf(outputF, "xor_r%u^=r%u\n", rx, ry); break;
-                    case 0x0E: std::fprintf(outputF, "sal_r%u<<=%u\n", rx, imm & 0x1F); break;
-                    case 0x0F: std::fprintf(outputF, "sar_r%u>>=%u\n", rx, imm & 0x1F); break;
-                }
-            }
-        }
-
-        std::fprintf(outputF, "-:dead:exit\n\n");
-        std::fprintf(outputF, "r0=%08x,r1=%08x,r2=%08x,r3=%08x,r4=%08x,r5=%08x,r6=%08x,r7=%08x,r8=%08x,r9=%08x,r10=%08x,r11=%08x,r12=%08x,r13=%08x,r14=%08x,r15=%08x\n",
-                static_cast<uint32_t>(ctx->uc_mcontext.gregs[REGS[0]]), static_cast<uint32_t>(ctx->uc_mcontext.gregs[REGS[1]]),
-                static_cast<uint32_t>(ctx->uc_mcontext.gregs[REGS[2]]), static_cast<uint32_t>(ctx->uc_mcontext.gregs[REGS[3]]),
-                static_cast<uint32_t>(ctx->uc_mcontext.gregs[REGS[4]]), static_cast<uint32_t>(ctx->uc_mcontext.gregs[REGS[5]]),
-                static_cast<uint32_t>(ctx->uc_mcontext.gregs[REGS[6]]), static_cast<uint32_t>(ctx->uc_mcontext.gregs[REGS[7]]),
-                static_cast<uint32_t>(ctx->uc_mcontext.gregs[REGS[8]]), static_cast<uint32_t>(ctx->uc_mcontext.gregs[REGS[9]]),
-                static_cast<uint32_t>(ctx->uc_mcontext.gregs[REGS[10]]), static_cast<uint32_t>(ctx->uc_mcontext.gregs[REGS[11]]),
-                static_cast<uint32_t>(ctx->uc_mcontext.gregs[REGS[12]]), static_cast<uint32_t>(ctx->uc_mcontext.gregs[REGS[13]]),
-                static_cast<uint32_t>(ctx->uc_mcontext.gregs[REGS[14]]), static_cast<uint32_t>(ctx->uc_mcontext.gregs[REGS[15]])
-        );
-
-        if (outputF) std::fclose(outputF);
-
-        munmap(PICO_MEM, 256);
-        munmap(const_1_0_0_0, 16);
-        munmap(const_0_1_0_0, 16);
-        munmap(const_0_0_1_0, 16);
-        munmap(const_0_0_0_1, 16);
-        if (codeMemory.code) munmap(codeMemory.code, codeMemory.size);
-
-        std::exit(0);
-    }
-} // Fim extern "C"
-
-int main(int argc, char* argv[]) {
-    using namespace PQP_JIT;
-
-    if (argc < 3) {
-        std::cerr << "Uso: " << argv[0] << " <input> <output>\n";
-        return EXIT_FAILURE;
-    }
-
-    // Leitura limpa de arquivo com C++ ifstream
-    std::ifstream inFile(argv[1]);
-    if (!inFile) {
-        std::cerr << "Erro ao abrir " << argv[1] << "\n";
-        return EXIT_FAILURE;
-    }
-
-    outputF = std::fopen(argv[2], "w");
-    if (!outputF) {
-        std::cerr << "Erro ao criar " << argv[2] << "\n";
-        return EXIT_FAILURE;
-    }
-
+/* ═══════════════════════════════════════════════════════════════
+   MAIN E INICIALIZAÇÃO
+   ═══════════════════════════════════════════════════════════════ */
+static void setup_signals() {
     stack_t ss;
-    ss.ss_sp = std::malloc(SIGSTKSZ);
+    ss.ss_sp = malloc(SIGSTKSZ);
     ss.ss_size = SIGSTKSZ;
     ss.ss_flags = 0;
-    sigaltstack(&ss, nullptr);
+    sigaltstack(&ss, NULL);
 
-    struct sigaction sa_jit = {0};
-    sa_jit.sa_sigaction = trapHandler;
-    sa_jit.sa_flags = SA_ONSTACK | SA_SIGINFO | SA_RESTART;
-    sigaction(SIGTRAP, &sa_jit, nullptr);
+    struct sigaction sa_trap = {0}, sa_segv = {0};
+    sa_trap.sa_sigaction = jit_compile;
+    sa_trap.sa_flags     = SA_ONSTACK | SA_SIGINFO | SA_RESTART;
+    sigaction(SIGTRAP, &sa_trap, NULL);
 
-    struct sigaction sa_end = {0};
-    sa_end.sa_sigaction = segvHandler;
-    sa_end.sa_flags = SA_ONSTACK | SA_SIGINFO;
-    sigaction(SIGSEGV, &sa_end, nullptr);
+    sa_segv.sa_sigaction = jit_exit;
+    sa_segv.sa_flags     = SA_ONSTACK | SA_SIGINFO;
+    sigaction(SIGSEGV, &sa_segv, NULL);
+}
 
-    // Mapeamentos de Memória com Casts limpos do C++
-    void* targetAddr0 = reinterpret_cast<void*>(0x10000000);
-    void* targetAddr2 = reinterpret_cast<void*>(0x10002000);
-    void* targetAddr3 = reinterpret_cast<void*>(0x10003000);
-    void* targetAddr4 = reinterpret_cast<void*>(0x10004000);
-    void* targetAddr5 = reinterpret_cast<void*>(0x10005000);
-    
-    PICO_MEM = reinterpret_cast<uint8_t*>(mmap(targetAddr0, 256, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0));
-    const_1_0_0_0 = reinterpret_cast<uint32_t*>(mmap(targetAddr2, 4*4, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0));
-    const_0_1_0_0 = reinterpret_cast<uint32_t*>(mmap(targetAddr3, 4*4, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0));
-    const_0_0_1_0 = reinterpret_cast<uint32_t*>(mmap(targetAddr4, 4*4, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0));
-    const_0_0_0_1 = reinterpret_cast<uint32_t*>(mmap(targetAddr5, 4*4, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0));
+int main(int argc, char *argv[]) {
+    g_input  = fopen(argv[1], "r");
+    g_output = fopen(argv[2], "w");
 
-    const_1_0_0_0[0] = 1; const_1_0_0_0[1] = 0; const_1_0_0_0[2] = 0; const_1_0_0_0[3] = 0;
-    const_0_1_0_0[0] = 0; const_0_1_0_0[1] = 1; const_0_1_0_0[2] = 0; const_0_1_0_0[3] = 0;
-    const_0_0_1_0[0] = 0; const_0_0_1_0[1] = 0; const_0_0_1_0[2] = 1; const_0_0_1_0[3] = 0;
-    const_0_0_0_1[0] = 0; const_0_0_0_1[1] = 0; const_0_0_0_1[2] = 0; const_0_0_0_1[3] = 1;
+    init_dispatch_table();
+    setup_signals();
 
-    // Lendo o hexadecimal com o std::string do C++ (ignora os espaços sozinho)
-    std::string tokenHex;
-    uint32_t counter = 0;
-    while (inFile >> tokenHex && counter < 256) {
-        // Converte a string hexadecimal em um inteiro de 8 bits
-        uint8_t byteLido = static_cast<uint8_t>(std::stoul(tokenHex, nullptr, 16));
-        
-        PICO_MEM[counter] = byteLido;
-        ORIGINAL_PICO_MEM[counter] = byteLido;
-        
-        counter++;
+    PICO_MEMO = mmap(NULL, 0x10000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+
+    /* Leitura Limpa Padrão - Imune a lixo */
+    uint32_t n = 0;
+    while (fgets(g_line_buf, sizeof g_line_buf, g_input)) {
+        unsigned int b[4];
+        if (sscanf(g_line_buf, "%x %x %x %x", &b[0], &b[1], &b[2], &b[3]) == 4) {
+            PICO_MEMO[n++] = (uint8_t)b[0];
+            PICO_MEMO[n++] = (uint8_t)b[1];
+            PICO_MEMO[n++] = (uint8_t)b[2];
+            PICO_MEMO[n++] = (uint8_t)b[3];
+        }
     }
-    inFile.close();
 
-    // Preparando a memória executável
-    codeMemory.code = reinterpret_cast<uint8_t*>(mmap(nullptr, SIZE_INITIAL_CODE + (counter << 2), PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    std::memset(codeMemory.code, 0xCC, SIZE_INITIAL_CODE + (counter << 2));
-    codeMemory.size = SIZE_INITIAL_CODE + (counter << 2);
+    /* * Aloca cobertura integral para o PC de 0x0000 até 0xFFFF. 
+     * Toda a área inicializa como INT3 (0xCC), fazendo a proteção
+     * total de limites sem dar brecha para o processador fugir.
+     */
+    size_t code_size = BOOTSTRAP_SIZE + (MAX_INST * SLOT_BYTES);
+    size_t total = code_size + 64; 
 
-    std::memcpy(codeMemory.code, initialCode, SIZE_INITIAL_CODE);
+    jit.code = mmap(NULL, total, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+    memset(jit.code, 0xCC, code_size); 
 
-    // Tipagem rígida do C++ para a conversão do ponteiro de memória em função invocável
-    void (*executarJIT)() = reinterpret_cast<void (*)()>(codeMemory.code);
-    executarJIT();
-    
-    return EXIT_SUCCESS;
+    /* Incorporar estrutura matemática das faixas dos Registradores XMM */
+    vector_lanes = (uint32_t*)(jit.code + code_size);
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            vector_lanes[i * 4 + j] = (i == j) ? 1 : 0;
+        }
+    }
+
+    build_bootstrap();
+
+    /* Arranca a VM direto para a rotina nativa em kernel-space */
+    ((void (*)(void))(jit.code))();
+
+    return 0;
 }
