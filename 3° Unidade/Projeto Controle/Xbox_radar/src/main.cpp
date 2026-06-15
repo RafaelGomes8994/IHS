@@ -1,48 +1,44 @@
 #include <Arduino.h>
-#include <BLEDevice.h>
-#include <BLEUtils.h>
-#include <BLEScan.h>
-#include <BLEAdvertisedDevice.h>
+#include "driver_motores.h"
+#include "driver_tcp.h"
+#include "driver_xbox.h"
 
-int scanTime = 10; // Vai procurar durante 10 segundos
-BLEScan* pBLEScan;
+QueueHandle_t filaComandos = nullptr;
 
-// O que acontece quando a ESP32 "ouve" algo no ar:
-class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
-    void onResult(BLEAdvertisedDevice advertisedDevice) {
-        if (advertisedDevice.haveName()) {
-            Serial.print("Dispositivo Encontrado: ");
-            Serial.print(advertisedDevice.getName().c_str());
-            Serial.print(" | MAC: ");
-            Serial.println(advertisedDevice.getAddress().toString().c_str());
-        }
-    }
-};
+static const char* WIFI_SSID     = "Yorkshire012@2_4hz";
+static const char* WIFI_PASSWORD = "Rafael@12";
 
 void setup() {
-  Serial.begin(115200);
-  
-  // Aqui é o momento crítico onde a energia costumava cair:
-  Serial.println("A ligar a Antena Bluetooth (Teste de Energia)...");
-  BLEDevice::init("");
-  
-  // Se passar da linha acima sem reiniciar, o cabo funcionou!
-  Serial.println("Antena ligada com sucesso! O cabo aguentou o pico de energia.");
+    Serial.begin(115200);
+    delay(500);
 
-  pBLEScan = BLEDevice::getScan(); 
-  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-  pBLEScan->setActiveScan(true); 
-  pBLEScan->setInterval(100);
-  pBLEScan->setWindow(99); 
+
+
+    Serial.println("\n[MAIN] Rover FPV iniciando...");
+
+    // 1. Cria a fila (o Cérebro)
+    filaComandos = xQueueCreate(10, sizeof(Direcao));
+
+    // 2. Inicializa os pinos físicos
+    inicializarMotores();
+
+    // 3. LIGA O WI-FI PRIMEIRO (Garante o IP antes de ligar o rádio BLE)
+    Serial.println("[MAIN] Iniciando Wi-Fi...");
+    inicializarWiFi(WIFI_SSID, WIFI_PASSWORD);
+    iniciarServidorTCP();
+
+    // 4. LIGA O BLUETOOTH POR ÚLTIMO
+    Serial.println("[MAIN] Iniciando Bluetooth...");
+    inicializarBLE(); 
+
+    // 5. Inicia as Tasks do FreeRTOS
+    xTaskCreatePinnedToCore(TaskMotores, "Motores", 2048, NULL, 2, NULL, 1);
+    
+    // A Task do Xbox agora roda em background, sem travar o main
+    xTaskCreatePinnedToCore(TaskXbox, "XboxBLE", 8192, NULL, 1, NULL, 0);
 }
 
 void loop() {
-  Serial.println("\n--- A procurar dispositivos Bluetooth (10s) ---");
-  BLEScanResults foundDevices = pBLEScan->start(scanTime, false);
-  
-  Serial.print("Varredura concluída. Total de dispositivos: ");
-  Serial.println(foundDevices.getCount());
-  
-  pBLEScan->clearResults();   
-  delay(2000);
+    verificarConexoesTCP();
+    delay(10);
 }
