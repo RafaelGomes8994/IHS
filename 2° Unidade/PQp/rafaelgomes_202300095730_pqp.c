@@ -186,8 +186,7 @@ static void do_exit(ucontext_t *ctx, uint32_t PC_exit) {
 
     exit(0);
 }
-// A assinatura (int, siginfo_t*, void*) é obrigatória, mas os nomes são seus!
-static void MinhaFuncaoQueCompila(int sinal_recebido, siginfo_t *info, void *ponteiro_contexto) {
+static void jit_compile(int sinal_recebido, siginfo_t *info, void *ponteiro_contexto) {
     ucontext_t *ctx = (ucontext_t *)ponteiro_contexto;
 
     uint64_t rip      = (uint64_t)ctx->uc_mcontext.gregs[REG_RIP];
@@ -221,7 +220,7 @@ static void MinhaFuncaoQueCompila(int sinal_recebido, siginfo_t *info, void *pon
     uint8_t shift;
 
     /* =========================================================================
-       O GRANDE SWITCH DE TRADUÇÃO (Adeus Dispatch Table)
+        SWITCH DE TRADUÇÃO 
        ========================================================================= */
     switch (opcode) {
         case 0x00: /* mov imm */
@@ -364,17 +363,14 @@ static void setup_signals() {
     ss.ss_flags = 0;
     sigaltstack(&ss, NULL);
 
-    // MUDANÇA: Nomes das variáveis da struct alterados
     struct sigaction config_breakpoint = {0}; 
     struct sigaction config_falha_memoria = {0};
 
-    // MUDANÇA: Apontando para os seus próprios nomes de função
-    config_breakpoint.sa_sigaction = MinhaFuncaoQueCompila; 
+    config_breakpoint.sa_sigaction = jit_compile; 
     config_breakpoint.sa_flags     = SA_ONSTACK | SA_SIGINFO | SA_RESTART;
     sigaction(SIGTRAP, &config_breakpoint, NULL);
 
-    // MUDANÇA: Apontando para a sua função de saída
-    config_falha_memoria.sa_sigaction = MinhaFuncaoQueCompila; 
+    config_falha_memoria.sa_sigaction = jit_compile; 
     config_falha_memoria.sa_flags     = SA_ONSTACK | SA_SIGINFO;
     sigaction(SIGSEGV, &config_falha_memoria, NULL);
 }
