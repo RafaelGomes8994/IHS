@@ -54,96 +54,96 @@ static char      g_line_buf[64];
 /* ═══════════════════════════════════════════════════════════════
    EMISSORES BÁSICOS
    ═══════════════════════════════════════════════════════════════ */
-static inline void emit_seek(uint64_t off) { jit.pos = off; }
-static inline void emit8(uint8_t b)        { jit.code[jit.pos++] = b; }
-static inline void emit32(uint32_t v)      { *(uint32_t *)&jit.code[jit.pos] = v; jit.pos += 4; }
-static inline void emit_imm16sx(int16_t v) { *(uint32_t *)&jit.code[jit.pos] = (uint32_t)(int32_t)v; jit.pos += 4; }
-static inline void emit_rel32(int32_t rel) { *(int32_t *)&jit.code[jit.pos] = rel; jit.pos += 4; }
+static inline void reposicionar_jit(uint64_t novo_offset) { jit.pos = novo_offset; }
+static inline void emitir_byte(uint8_t byte_value)       { jit.code[jit.pos++] = byte_value; }
+static inline void emitir_u32(uint32_t value_u32)        { *(uint32_t *)&jit.code[jit.pos] = value_u32; jit.pos += 4; }
+static inline void emitir_i32_sx(int16_t signed_imm16)   { *(uint32_t *)&jit.code[jit.pos] = (uint32_t)(int32_t)signed_imm16; jit.pos += 4; }
+static inline void emitir_i32_rel(int32_t rel_offset)    { *(int32_t *)&jit.code[jit.pos] = rel_offset; jit.pos += 4; }
 
-static inline uint8_t x86_reg_enc(uint8_t pqp_idx) { return PQP_TO_X86[pqp_idx] & 7; }
-static inline int needs_rex(uint8_t pqp_idx)       { return PQP_TO_X86[pqp_idx] >= 8; }
+static inline uint8_t codificar_reg_x86(uint8_t indice_reg_pqp) { return PQP_TO_X86[indice_reg_pqp] & 7; }
+static inline int precisa_rex(uint8_t indice_reg_pqp)           { return PQP_TO_X86[indice_reg_pqp] >= 8; }
 
 /* Injetor de Profiler Massivo via Registradores Vetoriais  */
-static inline void emit_fast_profiler(uint32_t PC) {
-    uint32_t inst_id = PC / 4;
-    uint32_t x_reg   = inst_id / 4;
-    uint32_t l_idx   = inst_id % 4;
+static inline void emit_fast_profiler(uint32_t program_counter) {
+    uint32_t instruction_id = program_counter / 4;
+    uint32_t vector_register_index = instruction_id / 4;
+    uint32_t lane_index = instruction_id % 4;
 
-    if (x_reg >= 8) {
-        emit8(0x66); emit8(0x44); emit8(0x0F); emit8(0xFE);
-        emit8(0x05 | ((x_reg - 8) << 3));
+    if (vector_register_index >= 8) {
+        emitir_byte(0x66); emitir_byte(0x44); emitir_byte(0x0F); emitir_byte(0xFE);
+        emitir_byte(0x05 | ((vector_register_index - 8) << 3));
     } else {
-        emit8(0x66); emit8(0x0F); emit8(0xFE);
-        emit8(0x05 | (x_reg << 3));
+        emitir_byte(0x66); emitir_byte(0x0F); emitir_byte(0xFE);
+        emitir_byte(0x05 | (vector_register_index << 3));
     }
 
     uint8_t *next_rip = jit.code + jit.pos + 4;
-    uint8_t *target_mem = (uint8_t *)&vector_lanes[l_idx * 4];
-    emit32((uint32_t)(target_mem - next_rip));
+    uint8_t *destination_memory = (uint8_t *)&vector_lanes[lane_index * 4];
+    emitir_u32((uint32_t)(destination_memory - next_rip));
 }
 
 /* ═══════════════════════════════════════════════════════════════
    GERAÇÃO DO BOOTSTRAP DINÂMICO
    ═══════════════════════════════════════════════════════════════ */
 static void build_bootstrap() {
-    emit_seek(0); 
+    reposicionar_jit(0); 
     
     /* 1. Zera GPRs nativos */
     for (int i = 15; i >= 0; i--) {
-        uint8_t enc = x86_reg_enc(i);
-        if (needs_rex(i)) emit8(0x4D); else emit8(0x48);
-        emit8(0x29);
-        emit8(0xC0 | (enc << 3) | enc);
+        uint8_t enc = codificar_reg_x86(i);
+        if (precisa_rex(i)) emitir_byte(0x4D); else emitir_byte(0x48);
+        emitir_byte(0x29);
+        emitir_byte(0xC0 | (enc << 3) | enc);
     }
     
     /* 2. Reseta o Floating Point Unit nativo */
-    emit8(0xDB); emit8(0xE3);
+    emitir_byte(0xDB); emitir_byte(0xE3);
     
     /* 3. Zera os 16 registradores XMM do processador iterativamente */
     for (int i = 0; i < 16; i++) {
-        emit8(0x66);
-        if (i >= 8) emit8(0x45);
-        emit8(0x0F); emit8(0xEF);
-        emit8(0xC0 | ((i & 7) << 3) | (i & 7));
+        emitir_byte(0x66);
+        if (i >= 8) emitir_byte(0x45);
+        emitir_byte(0x0F); emitir_byte(0xEF);
+        emitir_byte(0xC0 | ((i & 7) << 3) | (i & 7));
     }
 
     /* 4. Pula para o primeiro slot (offset absoluto) */
-    emit8(0xE9);
+    emitir_byte(0xE9);
     uint8_t *next_rip = jit.code + jit.pos + 4;
     uint8_t *dest = jit.code + BOOTSTRAP_SIZE;
-    emit32((uint32_t)(dest - next_rip));
+    emitir_u32((uint32_t)(dest - next_rip));
 }
 
 /* ═══════════════════════════════════════════════════════════════
    EMISSORES AUXILIARES E CONDICIONAIS
    ═══════════════════════════════════════════════════════════════ */
-static void emit_alu_rr(uint8_t opcode, uint8_t dst_pqp, uint8_t src_pqp) {
-    uint8_t dst_enc = x86_reg_enc(dst_pqp);
-    uint8_t src_enc = x86_reg_enc(src_pqp);
-    int dst_hi = needs_rex(dst_pqp), src_hi = needs_rex(src_pqp);
+static void emit_alu_rr(uint8_t opcode, uint8_t reg_destino_pqp, uint8_t reg_origem_pqp) {
+    uint8_t dst_enc = codificar_reg_x86(reg_destino_pqp);
+    uint8_t src_enc = codificar_reg_x86(reg_origem_pqp);
+    int dst_hi = precisa_rex(reg_destino_pqp), src_hi = precisa_rex(reg_origem_pqp);
 
     if (dst_hi || src_hi) {
-        emit8(0x40 | (src_hi ? 0x04 : 0) | (dst_hi ? 0x01 : 0));
+        emitir_byte(0x40 | (src_hi ? 0x04 : 0) | (dst_hi ? 0x01 : 0));
     }
-    emit8(opcode);
-    emit8(0xC0 | (src_enc << 3) | dst_enc);
+    emitir_byte(opcode);
+    emitir_byte(0xC0 | (src_enc << 3) | dst_enc);
 }
 
-static void emit_branch(uint8_t opc1, uint8_t opc2, uint32_t target_PC, int two_byte) {
-    if (two_byte) { emit8(opc1); emit8(opc2); } 
-    else { emit8(opc1); }
+static void emit_branch(uint8_t opcode_prefix, uint8_t opcode_suffix, uint32_t target_program_counter, int use_two_byte_opcode) {
+    if (use_two_byte_opcode) { emitir_byte(opcode_prefix); emitir_byte(opcode_suffix); } 
+    else { emitir_byte(opcode_prefix); }
     
     uint8_t *next_rip = jit.code + jit.pos + 4;
     uint8_t *dest_rip;
     
-    if (target_PC >= MAX_INST * 4) { 
+    if (target_program_counter >= MAX_INST * 4) { 
         dest_rip = jit.code + jit.size + 1024; 
     } else {
-        dest_rip = jit.code + BOOTSTRAP_SIZE + (target_PC * (SLOT_BYTES / 4)); 
+        dest_rip = jit.code + BOOTSTRAP_SIZE + (target_program_counter * (SLOT_BYTES / 4)); 
     }
     
     int32_t disp32 = (int32_t)(dest_rip - next_rip);
-    emit_rel32(disp32);
+    emitir_i32_rel(disp32);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -200,7 +200,7 @@ static void jit_compile(int sinal_recebido, siginfo_t *info, void *ponteiro_cont
     }
 
     xlat_order[xlat_count++] = PC;
-    emit_seek(BOOTSTRAP_SIZE + (slot_idx * SLOT_BYTES));
+    reposicionar_jit(BOOTSTRAP_SIZE + (slot_idx * SLOT_BYTES));
     uint64_t start_pos = jit.pos;
 
     emit_fast_profiler(PC);
@@ -225,10 +225,10 @@ static void jit_compile(int sinal_recebido, siginfo_t *info, void *ponteiro_cont
     switch (opcode) {
         case 0x00: /* mov imm */
             snprintf(xlat_str[PC], sizeof xlat_str[0], "mov_r%u,%08x\n", rD, (uint32_t)(int32_t)imm16);
-            d_enc = x86_reg_enc(rD);
-            if (needs_rex(rD)) emit8(0x41);
-            emit8(0xB8 + d_enc);
-            emit_imm16sx(imm16);
+            d_enc = codificar_reg_x86(rD);
+            if (precisa_rex(rD)) emitir_byte(0x41);
+            emitir_byte(0xB8 + d_enc);
+            emitir_i32_sx(imm16);
             break;
 
         case 0x01: /* mov r */
@@ -238,24 +238,24 @@ static void jit_compile(int sinal_recebido, siginfo_t *info, void *ponteiro_cont
 
         case 0x02: /* load */
             snprintf(xlat_str[PC], sizeof xlat_str[0], "mov_r%u,[r%u]\n", rD, rS);
-            d_enc = x86_reg_enc(rD); s_enc = x86_reg_enc(rS);
-            d_hi = needs_rex(rD); s_hi = needs_rex(rS);
-            if (d_hi || s_hi) emit8(0x40 | (d_hi ? 0x04 : 0) | (s_hi ? 0x01 : 0));
-            emit8(0x8B);
-            if (s_enc == 4) { emit8(0x80 | (d_enc << 3) | 4); emit8(0x24); } 
-            else { emit8(0x80 | (d_enc << 3) | s_enc); }
-            emit32((uint32_t)(uintptr_t)PICO_MEMO);
+            d_enc = codificar_reg_x86(rD); s_enc = codificar_reg_x86(rS);
+            d_hi = precisa_rex(rD); s_hi = precisa_rex(rS);
+            if (d_hi || s_hi) emitir_byte(0x40 | (d_hi ? 0x04 : 0) | (s_hi ? 0x01 : 0));
+            emitir_byte(0x8B);
+            if (s_enc == 4) { emitir_byte(0x80 | (d_enc << 3) | 4); emitir_byte(0x24); } 
+            else { emitir_byte(0x80 | (d_enc << 3) | s_enc); }
+            emitir_u32((uint32_t)(uintptr_t)PICO_MEMO);
             break;
 
         case 0x03: /* store */
             snprintf(xlat_str[PC], sizeof xlat_str[0], "mov_[r%u],r%u\n", rD, rS);
-            s_enc = x86_reg_enc(rS); d_enc = x86_reg_enc(rD);
-            s_hi = needs_rex(rS); d_hi = needs_rex(rD);
-            if (s_hi || d_hi) emit8(0x40 | (s_hi ? 0x04 : 0) | (d_hi ? 0x01 : 0));
-            emit8(0x89);
-            if (d_enc == 4) { emit8(0x80 | (s_enc << 3) | 4); emit8(0x24); } 
-            else { emit8(0x80 | (s_enc << 3) | d_enc); }
-            emit32((uint32_t)(uintptr_t)PICO_MEMO);
+            s_enc = codificar_reg_x86(rS); d_enc = codificar_reg_x86(rD);
+            s_hi = precisa_rex(rS); d_hi = precisa_rex(rD);
+            if (s_hi || d_hi) emitir_byte(0x40 | (s_hi ? 0x04 : 0) | (d_hi ? 0x01 : 0));
+            emitir_byte(0x89);
+            if (d_enc == 4) { emitir_byte(0x80 | (s_enc << 3) | 4); emitir_byte(0x24); } 
+            else { emitir_byte(0x80 | (s_enc << 3) | d_enc); }
+            emitir_u32((uint32_t)(uintptr_t)PICO_MEMO);
             break;
 
         case 0x04: /* cmp */
@@ -315,17 +315,17 @@ static void jit_compile(int sinal_recebido, siginfo_t *info, void *ponteiro_cont
         case 0x0E: /* sal */
             shift = PICO_MEMO[PC + 3] & 0x0F;
             snprintf(xlat_str[PC], sizeof xlat_str[0], "sal_r%u<<=%u\n", rD, shift);
-            d_enc = x86_reg_enc(rD);
-            if (needs_rex(rD)) emit8(0x41);
-            emit8(0xC1); emit8((4 << 3) | 0xC0 | d_enc); emit8(shift);
+            d_enc = codificar_reg_x86(rD);
+            if (precisa_rex(rD)) emitir_byte(0x41);
+            emitir_byte(0xC1); emitir_byte((4 << 3) | 0xC0 | d_enc); emitir_byte(shift);
             break;
 
         case 0x0F: /* sar */
             shift = PICO_MEMO[PC + 3] & 0x0F;
             snprintf(xlat_str[PC], sizeof xlat_str[0], "sar_r%u>>=%u\n", rD, shift);
-            d_enc = x86_reg_enc(rD);
-            if (needs_rex(rD)) emit8(0x41);
-            emit8(0xC1); emit8((7 << 3) | 0xC0 | d_enc); emit8(shift);
+            d_enc = codificar_reg_x86(rD);
+            if (precisa_rex(rD)) emitir_byte(0x41);
+            emitir_byte(0xC1); emitir_byte((7 << 3) | 0xC0 | d_enc); emitir_byte(shift);
             break;
 
         default:
@@ -339,13 +339,13 @@ static void jit_compile(int sinal_recebido, siginfo_t *info, void *ponteiro_cont
         uint32_t remaining = SLOT_BYTES - current_len;
         
         if (remaining >= 2) {
-            emit8(0xEB); 
-            emit8(remaining - 2); 
+                emitir_byte(0xEB); 
+                emitir_byte(remaining - 2); 
             while ((jit.pos - start_pos) < SLOT_BYTES) {
-                emit8(0x90);
+                    emitir_byte(0x90);
             }
         } else {
-            while ((jit.pos - start_pos) < SLOT_BYTES) emit8(0x90);
+                while ((jit.pos - start_pos) < SLOT_BYTES) emitir_byte(0x90);
         }
     }
 
